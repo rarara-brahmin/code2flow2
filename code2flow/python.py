@@ -6,7 +6,7 @@ from .model import (OWNER_CONST, GROUP_TYPE, Group, Node, Call, Variable,
                     BaseLanguage, djoin)
 
 
-def get_call_from_func_element(func):
+def get_call_from_func_element(func, scope_stack=None):
     """
     Given a python ast that represents a function call, clear and create our
     generic Call object. Some calls have no chance at resolution (e.g. array[2](param))
@@ -17,33 +17,34 @@ def get_call_from_func_element(func):
     """
     assert type(func) in (ast.Attribute, ast.Name, ast.Subscript, ast.Call)
     if type(func) == ast.Attribute:
-        owner_token = []
-        val = func.value
-        while True:
-            try:
-                val_attr = getattr(val, 'attr', val.id)
-                owner_token.append(val_attr)
-            except AttributeError:
-                pass
-            val = getattr(val, 'value', None)
-            if not val:
-                break
-        if owner_token:
-            owner_token = djoin(*reversed(owner_token))
-            # owner_token(リスト)の要素を.で連結してstrで返す
+        # 型推論によるowner_tokenの解決
+        owner_token = OWNER_CONST.UNKNOWN_VAR
+        if scope_stack is not None and isinstance(func.value, ast.Name):
+            var_name = func.value.id
+            for scope in reversed(scope_stack):
+                if var_name in scope:
+                    owner_token = scope[var_name]
+                    break
         else:
-            # ここを通るのはfunc.valueにattrという属性もidという属性もない場合。
-            owner_token = OWNER_CONST.UNKNOWN_VAR
+            # 従来のowner_token構築ロジック
+            owner_token_list = []
+            val = func.value
+            while True:
+                try:
+                    val_attr = getattr(val, 'attr', val.id)
+                    owner_token_list.append(val_attr)
+                except AttributeError:
+                    pass
+                val = getattr(val, 'value', None)
+                if not val:
+                    break
+            if owner_token_list:
+                owner_token = djoin(*reversed(owner_token_list))
 
         func_value = getattr(func, "value", None)
-        lib_name = None
         is_library = False
-        if func_value:
-            lib_name = getattr(func_value, "id", None)
-
-        if lib_name:
+        if owner_token and owner_token != OWNER_CONST.UNKNOWN_VAR:
             is_library = True
-
         return Call(token=func.attr, line_number=func.lineno, owner_token=owner_token, is_library=is_library)
     if type(func) == ast.Name:
         return Call(token=func.id, line_number=func.lineno)
@@ -51,7 +52,7 @@ def get_call_from_func_element(func):
         return None
 
 
-def make_calls(lines):
+def make_calls(lines, scope_stack=None):
     """
     Given a list of lines, find all calls in this list.
 
@@ -59,18 +60,19 @@ def make_calls(lines):
     :rtype: list[Call]
     """
 
+    # ToDo: ast.Import, ast.ImprotFromの場合にcallに何を詰めて返すのか。
     calls = []
     for tree in lines:
         for element in ast.walk(tree):
             if type(element) != ast.Call:
                 continue
-            call = get_call_from_func_element(element.func)
+            call = get_call_from_func_element(element.func, scope_stack)
             if call:
                 calls.append(call)
     return calls
 
 
-def process_assign(element):
+def process_assign(element, scope_stack=None):
     """
     Given an element from the ast which is an assignment statement, return a
     Variable that points_to the type of object being assigned. For now, the
@@ -82,20 +84,27 @@ def process_assign(element):
 
     if type(element.value) != ast.Call:
         return []
-    call = get_call_from_func_element(element.value.func)
+    call = get_call_from_func_element(element.value.func, scope_stack)
     if not call:
         return []
 
     ret = []
+    # 型推論: 右辺がクラスインスタンス化なら型情報を記録
+    class_name = None
+    if isinstance(element.value.func, ast.Name):
+        class_name = element.value.func.id
     for target in element.targets:
         if type(target) != ast.Name:
             continue
         token = target.id
         ret.append(Variable(token, call, element.lineno))
+        # スコープスタックに型情報を記録
+        if scope_stack is not None and class_name:
+            scope_stack[-1][token] = class_name
     return ret
 
 
-def process_import(element):
+def process_import(element, scope_stack=None):
     """
     Given an element from the ast which is an import statement, return a
     Variable that points_to the module being imported. For now, the
@@ -111,13 +120,19 @@ def process_import(element):
         token = single_import.asname or single_import.name
         rhs = single_import.name
 
+        # For ImportFrom, element.module contains the package/module
         if hasattr(element, 'module') and element.module:
             rhs = djoin(element.module, rhs)
+
+        # Record import mapping in current scope if provided
+        if scope_stack is not None:
+            scope_stack[-1][token] = rhs
+
         ret.append(Variable(token, points_to=rhs, line_number=element.lineno))
     return ret
 
 
-def make_local_variables(lines, parent):
+def make_local_variables(lines, parent, scope_stack=None):
     """
     Given an ast of all the lines in a function, generate a list of
     variables in that function. Variables are tokens and what they link to.
@@ -129,12 +144,14 @@ def make_local_variables(lines, parent):
     :rtype: list[Variable]
     """
     variables = []
+    if scope_stack is None:
+        scope_stack = [{}]  # グローバルスコープ
     for tree in lines:
         for element in ast.walk(tree):
             if type(element) == ast.Assign:
-                variables += process_assign(element)
+                variables += process_assign(element, scope_stack)
             if type(element) in (ast.Import, ast.ImportFrom):
-                variables += process_import(element)
+                variables += process_import(element, scope_stack)
     if parent.group_type == GROUP_TYPE.CLASS:
         variables.append(Variable('self', parent, lines[0].lineno))
 
@@ -199,12 +216,15 @@ class Python(BaseLanguage):
         groups = []
         nodes: list[Node] = []
         body = []
+        imports = []
 
         for el in tree.body:
-            if type(el) in (ast.FunctionDef, ast.AsyncFunctionDef, ast.Import):
+            if type(el) in (ast.FunctionDef, ast.AsyncFunctionDef):
                 nodes.append(el)
             elif type(el) == ast.ClassDef:
                 groups.append(el)
+            elif type(el) == ast.Import:
+                imports.append(el)
             elif getattr(el, 'body', None):
                 tup = Python.separate_namespaces(el)
                 groups += tup[0]
@@ -212,7 +232,7 @@ class Python(BaseLanguage):
                 body += tup[2]
             else:
                 body.append(el)
-        return groups, nodes, body
+        return groups, nodes, body, imports
 
     @staticmethod
     def make_nodes(tree: ast.AST, parent: Group) -> list[Node]:
@@ -227,8 +247,18 @@ class Python(BaseLanguage):
         """
         token = tree.name
         line_number = tree.lineno
-        calls = make_calls(tree.body)
-        variables = make_local_variables(tree.body, parent)
+        # スコープスタックを関数ごとにpush/pop
+        # Initialize function scope with module-level imports if available so
+        # that references to module names (e.g. `re`) resolve inside functions.
+        module_scope = {}
+        if getattr(parent, 'group_type', None) == GROUP_TYPE.FILE:
+            module_scope = getattr(parent, 'module_scope', {}) or {}
+        elif getattr(parent, 'group_type', None) == GROUP_TYPE.CLASS:
+            module_scope = getattr(parent.parent, 'module_scope', {}) or {}
+        # copy to avoid mutating the shared module scope
+        scope_stack = [dict(module_scope), {}]
+        variables = make_local_variables(tree.body, parent, scope_stack)
+        calls = make_calls(tree.body, scope_stack)
         is_constructor = False
         if parent.group_type == GROUP_TYPE.CLASS and token in ['__init__', '__new__']:
             is_constructor = True
@@ -247,12 +277,12 @@ class Python(BaseLanguage):
     def make_import_module_nodes(import_module: ast.Import, parent):
         """
         ToDo: make_nodesメソッドをベースにしてimportモジュールをノード化したい。
-          import_treeからimportモジュールをnode化するようにmake_nodesを改造する。
+            import_treeからimportモジュールをnode化するようにmake_nodesを改造する。
 
         Todo: import_treeはast.Import（ast.FunctionDefとの構造の違いに注意）
-         なのでこれをdot言語に起こせるように成形してNodeに詰める。
-         dot言語作成時に読む属性はlabel, name, shape, style, fillcolor
-         （詳細はmodel.py Node.to_dot()参照）
+        なのでこれをdot言語に起こせるように成形してNodeに詰める。
+        dot言語作成時に読む属性はlabel, name, shape, style, fillcolor
+        （詳細はmodel.py Node.to_dot()参照）
         :param tree ast.Import:
         :param parent Group:
         :rtype: list[Node]
@@ -276,7 +306,7 @@ class Python(BaseLanguage):
         if parent.group_type == GROUP_TYPE.FILE:
             import_tokens = [djoin(parent.token, token)]
 
-        ret = [Node(token, None, None, parent, import_tokens=import_tokens,
+        ret = [Node(token, [], None, parent, import_tokens=import_tokens,
                     line_number=line_number, is_constructor=False, is_library=True)]
 
         return ret
@@ -293,8 +323,17 @@ class Python(BaseLanguage):
         """
         token = "(global)"
         line_number = 0
-        calls = make_calls(lines)
-        variables = make_local_variables(lines, parent)
+        # Create a scope for module-level (global) variables/imports
+        scope_stack = [{}]
+        # Populate imports/assignments into the scope before extracting calls
+        # so that calls like `re.match()` can resolve `re` from the import.
+        variables = make_local_variables(lines, parent, scope_stack)
+        # Expose module-level scope on the parent group so functions can inherit it
+        try:
+            parent.module_scope = scope_stack[0]
+        except Exception:
+            pass
+        calls = make_calls(lines, scope_stack)
         return Node(token, calls, variables, line_number=line_number, parent=parent)
 
     @staticmethod
@@ -309,7 +348,7 @@ class Python(BaseLanguage):
         :rtype: Group
         """
         assert type(tree) == ast.ClassDef
-        subgroup_trees, node_trees, body_trees = Python.separate_namespaces(tree)
+        subgroup_trees, node_trees, body_trees, import_trees = Python.separate_namespaces(tree)
 
         group_type = GROUP_TYPE.CLASS
         token = tree.name

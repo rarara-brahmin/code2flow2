@@ -10,7 +10,51 @@ import ast
 
 from .python import Python
 from .model import (TRUNK_COLOR, LEAF_COLOR, NODE_COLOR, GROUP_TYPE, OWNER_CONST,
-                    Edge, Group, Node, Variable, is_installed, flatten, Call)
+                    Edge, Group, Node, Variable, is_installed, flatten, Call, djoin)
+
+
+def resolve_import_path(module_name, base_dir):
+    """Resolve a dotted module name to a local .py file under base_dir.
+
+    Example: 'exclude_modules_b' -> '<base_dir>/exclude_modules_b.py'
+    """
+    parts = module_name.split('.')
+    candidate = os.path.join(base_dir, *parts) + '.py'
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+
+def parse_file_recursive(file_path, base_dir, parsed_files, language_ext):
+    """Parse a file and recursively parse local imports, returning a list of Groups.
+
+    Keeps track of parsed files in `parsed_files` to avoid cycles.
+    """
+    if file_path in parsed_files:
+        return []
+    parsed_files.add(file_path)
+
+    with open(file_path, encoding='utf-8') as f:
+        tree = ast.parse(f.read())
+
+    # Create the file group for this file
+    file_group = make_file_group(tree, file_path, language_ext)
+    groups = [file_group]
+
+    # Walk AST for import statements and recurse for local modules
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                dep_path = resolve_import_path(alias.name, base_dir)
+                if dep_path:
+                    groups += parse_file_recursive(dep_path, base_dir, parsed_files, language_ext)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                dep_path = resolve_import_path(node.module, base_dir)
+                if dep_path:
+                    groups += parse_file_recursive(dep_path, base_dir, parsed_files, language_ext)
+
+    return groups
 
 VERSION = '2.5.1'
 
@@ -352,7 +396,7 @@ def make_file_group(tree: ast.AST, filename: str, extension: str) -> Group:
 
     # ToDo: tree.body[4].body[1].targets[0].idにreqが格納されている。
     #   reqではなくrequest.getをnode_trees内にNodeとして登録したい。
-    subgroup_trees, node_trees, body_trees = language.separate_namespaces(tree)
+    subgroup_trees, node_trees, body_trees, import_tree = language.separate_namespaces(tree)
     # tree内のast要素を分類してリストにして返す。
 
     group_type = GROUP_TYPE.FILE
@@ -363,12 +407,18 @@ def make_file_group(tree: ast.AST, filename: str, extension: str) -> Group:
 
     file_group = Group(token, group_type, display_name, import_tokens,
                        line_number, parent=None)
+
+    # Include import statements in the root node lines so module-level
+    # imports are recorded into the module scope (used when resolving
+    # names inside functions). Create the root node first so subsequent
+    # function nodes can inherit the module scope.
+    root_lines = list(body_trees) + list(import_tree)
+    file_group.add_node(language.make_root_node(root_lines, parent=file_group), is_root=True)
+
     for node_tree in node_trees:
         # node_treeはast.FunctionDef or ast.AsyncFunctionDef
         for new_node in language.make_nodes(node_tree, parent=file_group):
             file_group.add_node(new_node)
-
-    file_group.add_node(language.make_root_node(body_trees, parent=file_group), is_root=True)
 
     for subgroup_tree in subgroup_trees:
         file_group.add_subgroup(language.make_class_group(subgroup_tree, parent=file_group))
@@ -390,10 +440,102 @@ def make_file_group(tree: ast.AST, filename: str, extension: str) -> Group:
     return file_group
 
 
+def _find_library_node_by_signature(call: Call, all_nodes: list[Node]) -> Node:
+    """
+    ライブラリ呼び出しに対応するライブラリノードを検索する
+    
+    :param call Call: ライブラリ呼び出し
+    :param all_nodes list[Node]: すべてのノード
+    :rtype: Node|None
+    """
+    if not (call.is_library and call.is_attr() and call.owner_token):
+        return None
+    
+    lib_signature = djoin(call.owner_token, call.token)
+    module_name = call.owner_token.split('.')[0] if '.' in call.owner_token else call.owner_token
+
+    # Debug: list candidate nodes that share the token
+    candidates = [n for n in all_nodes if n.token == call.token]
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(f"[_find_library_node_by_signature] lib_signature={lib_signature} module_name={module_name} candidates={[(n.token, getattr(n.parent,'token',None), n.import_tokens, n.is_library) for n in candidates]}")
+
+    # Prefer concrete nodes (from parsed files) whose import_tokens match the signature
+    # or whose parent module name matches. Do not restrict to node.is_library; real
+    # file nodes should be considered first to avoid misattributing calls to libraries
+    # when a local module defines the same function name.
+    for node in candidates:
+        if lib_signature in (node.import_tokens or []):
+            logging.debug(f"[_find_library_node_by_signature] matched by import_tokens: {node.token} parent={getattr(node.parent,'token',None)}")
+            return node
+
+        if isinstance(node.parent, Group) and node.parent.token == module_name:
+            logging.debug(f"[_find_library_node_by_signature] matched by parent token: {node.token} parent={node.parent.token}")
+            return node
+
+    # Fallback: if no concrete node matched, look for synthesized library nodes
+    for node in all_nodes:
+        if not (node.is_library and node.token == call.token):
+            continue
+
+        if lib_signature in (node.import_tokens or []):
+            logging.debug(f"[_find_library_node_by_signature] matched synthesized by import_tokens: {node.token} parent={getattr(node.parent,'token',None)}")
+            return node
+
+        if isinstance(node.parent, Group) and node.parent.token == module_name:
+            logging.debug(f"[_find_library_node_by_signature] matched synthesized by parent token: {node.token} parent={node.parent.token}")
+            return node
+
+    logging.debug(f"[_find_library_node_by_signature] no match found for {lib_signature}")
+    return None
+
+
+def _find_library_node_from_variable(call: Call, var: Variable, all_nodes: list[Node]) -> Node:
+    """
+    変数がライブラリインスタンスの場合、その変数経由のメソッド呼び出しに対応するライブラリノードを検索する
+    
+    :param call Call: メソッド呼び出し（例：parser.add_argument()）
+    :param var Variable: 変数（例：parser = argparse.ArgumentParser()）
+    :param all_nodes list[Node]: すべてのノード
+    :rtype: Node|None
+    """
+    if not (call.is_attr() and call.owner_token == var.token):
+        return None
+    
+    if not isinstance(var.points_to, Call):
+        logging.debug(f"[_find_library_node_from_variable] var.points_toはCallではない: {type(var.points_to).__name__}")
+        return None
+    
+    library_call = var.points_to
+    if not (library_call.is_library and library_call.is_attr()):
+        logging.debug(f"[_find_library_node_from_variable] var.points_toはライブラリ呼び出しではない: is_library={library_call.is_library}, is_attr()={library_call.is_attr()}")
+        return None
+    
+    # 元のライブラリ呼び出し（例：argparse.ArgumentParser）からモジュール名を取得
+    lib_module_name = library_call.owner_token.split('.')[0] if '.' in library_call.owner_token else library_call.owner_token
+    logging.debug(f"[_find_library_node_from_variable] ライブラリモジュール名: {lib_module_name}, 検索するメソッド名: {call.token}")
+    
+    # 対応するライブラリノードを検索（メソッド名で検索、例：add_argument）
+    candidates = [n for n in all_nodes if n.token == call.token]
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(f"[_find_library_node_from_variable] lib_module_name={lib_module_name} call.token={call.token} candidates={[(n.token, getattr(n.parent,'token',None), n.import_tokens, n.is_library) for n in candidates]}")
+
+    for node in candidates:
+        if node.is_library and node.token == call.token:
+            if isinstance(node.parent, Group) and node.parent.token == lib_module_name:
+                logging.debug(f"[_find_library_node_from_variable] ライブラリノードが見つかりました: {node.token} parent={node.parent.token}")
+                return node
+    
+    logging.debug(f"[_find_library_node_from_variable] ライブラリノードが見つかりませんでした: token={call.token}, module={lib_module_name}")
+    return None
+
+
 def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     """
     Given a call that happened on a node (node_a), return the node
     that the call links to and the call itself if >1 node matched.
+    ノード (node_a) で発生した呼び出しが指定されると、
+
+    呼び出しがリンクされているノードと、一致するノードが 1 つ以上ある場合は呼び出し自体を返します。
 
     :param call Call:
     :param node_a Node:
@@ -402,50 +544,59 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     :returns: The node it links to and the call if >1 node matched.
     :rtype: (Node|None, Call|None)
     """
+    logging.debug(f"[_find_link_for_call] 呼び出しチェック開始: node_a.token={node_a.token}, call.to_string()={call.to_string()}, call.owner_token={call.owner_token}, call.token={call.token}, call.is_attr()={call.is_attr()}, call.is_library={call.is_library}")
 
     # ToDo: ここで呼び元の解析を行って変数をリストアップしているっぽい？
     #   ⇒ここではcall.line_numberが特定されているのでこれより前のcallを登録する部分に手を入れないとダメでは？
     #   ⇒node_a(token=print_hi).calls[1]でowner_tokenがrequestsになっているので登録はされている。
-
-    if getattr(call, "owner_token") == "requests":
-        pass
-        # デバッグ用。ブレイクポイントいらなくなったら消す。
-    else:
-        pass
+    # 1. 直接のライブラリ呼び出しをチェック（例：argparse.ArgumentParser()）
+    lib_node = _find_library_node_by_signature(call, all_nodes)
+    if lib_node:
+        return lib_node, None, None
 
     all_vars = node_a.get_variables(call.line_number)
 
+    # 2. ライブラリインスタンス経由の呼び出しをチェック（例：parser.add_argument()）
+    if call.is_attr() and call.owner_token:
+        logging.debug(f"[_find_link_for_call] ライブラリインスタンス経由の呼び出しチェック: call.owner_token={call.owner_token}, call.token={call.token}")
+        for var in all_vars:
+            if call.owner_token == var.token:
+                logging.debug(f"[_find_link_for_call] 変数マッチ: var.token={var.token}, var.points_to型={type(var.points_to).__name__}")
+                lib_node = _find_library_node_from_variable(call, var, all_nodes)
+                if lib_node:
+                    return lib_node, None, None
+
+    # 3. 変数マッチングによる解決
     for var in all_vars:
-        if getattr(var.points_to, "owner_token", None) == "requests":
-            pass
-            # デバッグ用。ブレイクポイントいらなくなったら消す。
-
         var_match = call.matches_variable(var)
-        if var_match:
-            # Unknown modules (e.g. third party) we don't want to match)
-            if var_match == OWNER_CONST.UNKNOWN_MODULE:
-                return None, None, None
-            # assert isinstance(var_match, Node)
-            return var_match, None, None
+        if not var_match:
+            continue
+        
+        # 未知のモジュールはマッチしないようにする
+        if var_match == OWNER_CONST.UNKNOWN_MODULE:
+            return None, None, None
+        
+        # ライブラリ呼び出しで変数がマッチした場合でも、ライブラリノードが存在すればそれを優先する
+        lib_node = _find_library_node_by_signature(call, all_nodes)
+        if lib_node:
+            return lib_node, None, None
+        
+        return var_match, None, None
 
+    # 4. 直接的なノードマッチング
     possible_nodes = []
-    # code.tokenがnode.tokenであるもの
-
     impossible_nodes = []
+
     if call.is_attr():
+        node_a_file_group = node_a.file_group()
         for node in all_nodes:
-            # checking node.parent != node_a.file_group() prevents self linkage in cases like
-            # function a() {b = Obj(); b.a()}
-            node_a_file_group = node_a.file_group()
             if call.token == node.token and node.parent != node_a_file_group:
                 possible_nodes.append(node)
             else:
                 impossible_nodes.append((node, 1))
     else:
         for node in all_nodes:
-            if call.token == node.token \
-               and isinstance(node.parent, Group)  \
-               and node.parent.group_type == GROUP_TYPE.FILE:
+            if call.token == node.token and isinstance(node.parent, Group) and node.parent.group_type == GROUP_TYPE.FILE:
                 possible_nodes.append(node)
             elif call.token == node.parent.token and node.is_constructor:
                 possible_nodes.append(node)
@@ -472,7 +623,16 @@ def _find_links(node_a: Node, all_nodes):
     """
 
     links = []
+
+    if node_a.calls is None:
+        pass
+
     for call in node_a.calls:
+        # node_aがライブラリの場合はここでNoneType is not iterableで怒られる。
+        # 関数は呼び先がない場合もcallsには空のリストが割り当たっているのでNode生成時にライブラリもそうすべき。
+        if call.owner_token is not None:
+            pass
+
         _possible_node, _call, _nodes = _find_link_for_call(call, node_a, all_nodes)
         lfc = (_possible_node, _call)
         assert not isinstance(lfc, Group)
@@ -526,10 +686,22 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                 raise ex
 
     # 2. Find all groups (classes/modules), nodes (functions) (a lot happens here) and external-modules
+    # Use recursive parsing to include local imported modules so that
+    # imports like `from exclude_modules_b import match` get their definitions
+    # included in the file_groups for resolution later.
     file_groups = []
-    for source, file_ast_tree in file_ast_trees:
-        file_group = make_file_group(file_ast_tree, source, extension)
-        file_groups.append(file_group)
+    parsed_files = set()
+    for source, _file_ast_tree in file_ast_trees:
+        base_dir = os.path.dirname(source) or '.'
+        try:
+            groups = parse_file_recursive(source, base_dir, parsed_files, extension)
+            for g in groups:
+                file_groups.append(g)
+        except Exception as ex:
+            if skip_parse_errors:
+                logging.warning("Could not parse dependency tree for %r (%r). Skipping...", source, ex)
+            else:
+                raise
 
     # 3. Trim namespaces / functions to exactly what we want
     if exclude_namespaces or include_only_namespaces:
@@ -539,9 +711,14 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
 
     # 4. Consolidate structures
     # file_groupsに階層化してあるnodesとsubgroupsをここで同一階層に展開する。
-    all_subgroups = flatten(g.all_groups() for g in file_groups)
-    all_nodes = flatten(g.all_nodes() for g in file_groups)
-    all_imports = flatten(g.all_imports() for g in file_groups)
+    unflatten_g_groups = [g.all_groups() for g in file_groups]
+    all_subgroups = flatten(unflatten_g_groups)
+
+    unflatten_g_nodes = [g.all_nodes() for g in file_groups]
+    all_nodes = flatten(unflatten_g_nodes)
+
+    unflatten_g_imports = [g.all_imports() for g in file_groups]
+    all_imports = flatten(unflatten_g_imports)
 
     nodes_by_subgroup_token = collections.defaultdict(list)
     for subgroup in all_subgroups:
@@ -560,7 +737,8 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
 
     # 5. Attempt to resolve the variables (point them to a node or group)
     for node in all_nodes:
-        node.resolve_variables(file_groups)
+        if node.variables is not None:
+            node.resolve_variables(file_groups)
         # Todo:↑にfile_groupだけではなくlib_groupも追加して解決してやる必要があるのでは？
         #      file_groupの要素にimportsも入っているので大丈夫のはず。
         
@@ -568,10 +746,64 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     # Not a step. Just log what we know so far
     logging.info("Found groups %r." % [g.label() for g in all_subgroups])
     logging.info("Found nodes %r." % sorted(n.token_with_ownership() for n in all_nodes))
-    logging.info("Found calls %r." % sorted(list(set(c.to_string() for c in
-                                                     flatten(n.calls for n in all_nodes)))))
+    unflatten_n_calls = [n.calls for n in all_nodes]
+    logging.info("Found calls %r." % sorted(list(set(c.to_string() for c in flatten(unflatten_n_calls)))))
     logging.info("Found variables %r." % sorted(list(set(v.to_string() for v in
                                                          flatten(n.variables for n in all_nodes)))))
+
+    # 5.5. ライブラリ呼び出しからライブラリ関数のノードを作成する
+    # すべてのライブラリ呼び出しを収集し、それらのノードを作成する
+    library_nodes_by_signature = {}
+    library_groups_by_module = {}
+    
+    unflatten_n_calls_all = [n.calls for n in all_nodes if n.calls]
+    all_calls = flatten(unflatten_n_calls_all)
+    
+    for call in all_calls:
+        if call.is_library and call.is_attr() and call.owner_token:
+            # ライブラリ関数のシグネチャを作成（例："requests.get"）
+            lib_signature = djoin(call.owner_token, call.token)
+            
+            if lib_signature not in library_nodes_by_signature:
+                # モジュール名を抽出（owner_tokenの最初の部分）
+                module_name = call.owner_token.split('.')[0] if '.' in call.owner_token else call.owner_token
+                
+                # ライブラリモジュールのグループを作成または取得
+                if module_name not in library_groups_by_module:
+                    lib_group = Group(
+                        token=module_name,
+                        group_type=GROUP_TYPE.NAMESPACE,
+                        display_type="Library",
+                        import_tokens=[module_name],
+                        line_number=0,
+                        parent=None
+                    )
+                    library_groups_by_module[module_name] = lib_group
+                
+                lib_group = library_groups_by_module[module_name]
+                
+                # ライブラリ関数のノードを作成
+                lib_node = Node(
+                    token=call.token,
+                    calls=[],
+                    variables=None,
+                    parent=lib_group,
+                    import_tokens=[lib_signature],
+                    line_number=call.line_number,
+                    is_constructor=False,
+                    is_library=True
+                )
+                
+                lib_group.add_node(lib_node)
+                library_nodes_by_signature[lib_signature] = lib_node
+    
+    # ライブラリグループをfile_groupsに追加し、ライブラリノードをall_nodesに追加する
+    for lib_group in library_groups_by_module.values():
+        # 最初のfile_groupに疑似サブグループとして追加する
+        if file_groups:
+            file_groups[0].add_subgroup(lib_group)
+            lib_group.parent = file_groups[0]
+        all_nodes.extend(lib_group.all_nodes())
 
     # 6. Find all calls between all nodes
     bad_calls = []
@@ -910,6 +1142,31 @@ def main(sys_argv=None):
         '--version', action='version', version='%(prog)s ' + VERSION)
 
     sys_argv = sys_argv or sys.argv[1:]
+
+    # Support simple key=value overrides on the command line, e.g.
+    #   python -m code2flow <sources> level=DEBUG
+    # This extracts known overrides and removes them from argv before
+    # handing the rest to argparse.
+    explicit_level = None
+    filtered_argv = []
+    for item in sys_argv:
+        if isinstance(item, str) and item.startswith('level='):
+            val = item.split('=', 1)[1]
+            # allow either 'DEBUG' or 'logging.DEBUG'
+            if val.startswith('logging.'):
+                val = val.split('.', 1)[1]
+            # numeric level accepted
+            try:
+                explicit_level = int(val)
+            except Exception:
+                lvl = val.upper()
+                explicit_level = getattr(logging, lvl, None)
+                if explicit_level is None:
+                    logging.warning("Unknown logging level %r passed via CLI; ignoring.", val)
+            continue
+        filtered_argv.append(item)
+
+    sys_argv = filtered_argv
     args = parser.parse_args(sys_argv)
     level = logging.INFO
     if args.verbose and args.quiet:
@@ -927,6 +1184,11 @@ def main(sys_argv=None):
     lang_params = LanguageParams(args.source_type, args.ruby_version)
     subset_params = SubsetParams.generate(args.target_function, args.upstream_depth,
                                           args.downstream_depth)
+
+    # If the user passed an explicit level via key=value on the command line,
+    # prefer that over --verbose/--quiet computed value.
+    if explicit_level is not None:
+        level = explicit_level
 
     code2flow(
         raw_source_paths=args.sources,
