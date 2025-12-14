@@ -13,6 +13,9 @@ from .python import Python
 from .model import (TRUNK_COLOR, LEAF_COLOR, NODE_COLOR, GROUP_TYPE, OWNER_CONST,
                     Edge, Group, Node, Variable, is_installed, flatten, Call, djoin)
 
+# Global switch to enable/disable heuristic resolution features.
+# Controlled by CLI flag --heuristics / --no-heuristics (default: enabled).
+_HEURISTICS_ENABLED = True
 
 def resolve_import_path(module_name, base_dir):
     """Resolve a dotted module name to a local .py file under base_dir.
@@ -574,9 +577,8 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     logging.debug(f"[_find_link_for_call] 呼び出しチェック開始: node_a.token={node_a.token}, call.to_string()={call.to_string()}, call.owner_token={call.owner_token}, call.token={call.token}, call.is_attr()={call.is_attr()}, call.is_library={call.is_library}")
 
     # 0.5. owner == 'self' の場合、まず同クラス内のメソッドを探し、なければ継承チェーンを探す
-    # これをライブラリマッチより先に行うことで、同クラスや継承元に定義された
-    # メソッド（例: Abra.cadabra, PentatonicScales.pentaNum）を優先して図示できるようにする。
-    if call.is_attr() and call.owner_token == 'self':
+    # 実行はヒューリスティックが有効な場合のみ行う（CLIオプションで制御）。
+    if _HEURISTICS_ENABLED and call.is_attr() and call.owner_token == 'self':
         parent_group = getattr(node_a, 'parent', None)
         candidates = []
         if parent_group and getattr(parent_group, 'group_type', None) == GROUP_TYPE.CLASS:
@@ -702,7 +704,7 @@ def _find_links(node_a: Node, all_nodes):
 
 def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_functions,
            include_only_namespaces, include_only_functions,
-           skip_parse_errors, lang_params, alias_labels=False):
+           skip_parse_errors, lang_params, alias_labels=False, heuristics=True):
     """
     Given a language implementation and a list of filenames, do these things:
     1. Read/parse source ASTs
@@ -751,12 +753,21 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     # included in the file_groups for resolution later.
     file_groups = []
     parsed_files = set()
+    # Heuristics toggle: when enabled, recursively follow local imports. When
+    # disabled, only parse the explicit source files provided on the CLI.
+    global _HEURISTICS_ENABLED
+    _HEURISTICS_ENABLED = bool(heuristics)
+
     for source, _file_ast_tree in file_ast_trees:
         base_dir = os.path.dirname(source) or '.'
         try:
-            groups = parse_file_recursive(source, base_dir, parsed_files, extension)
-            for g in groups:
-                file_groups.append(g)
+            if _HEURISTICS_ENABLED:
+                groups = parse_file_recursive(source, base_dir, parsed_files, extension)
+                for g in groups:
+                    file_groups.append(g)
+            else:
+                # Only parse the explicit file; do not follow imports.
+                file_groups.append(make_file_group(_file_ast_tree, source, extension))
         except Exception as ex:
             if skip_parse_errors:
                 logging.warning("Could not parse dependency tree for %r (%r). Skipping...", source, ex)
@@ -789,11 +800,17 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
 
     for group in file_groups:
         for subgroup in group.all_groups():
-            subgroup.inherits = [nodes_by_subgroup_token.get(g) for g in subgroup.inherits]
-            subgroup.inherits = list(filter(None, subgroup.inherits))
-            for inherit_nodes in subgroup.inherits:
-                for node in subgroup.nodes:
-                    node.variables += [Variable(n.token, n, n.line_number) for n in inherit_nodes]
+            # Populate inheritance links and inject inherited methods as
+            # variables into subclasses only when heuristics are enabled.
+            if _HEURISTICS_ENABLED:
+                subgroup.inherits = [nodes_by_subgroup_token.get(g) for g in subgroup.inherits]
+                subgroup.inherits = list(filter(None, subgroup.inherits))
+                for inherit_nodes in subgroup.inherits:
+                    for node in subgroup.nodes:
+                        node.variables += [Variable(n.token, n, n.line_number) for n in inherit_nodes]
+            else:
+                # If heuristics disabled, keep original inherited token names (unresolved)
+                subgroup.inherits = []
 
     # 5. Attempt to resolve the variables (point them to a node or group)
     for node in all_nodes:
@@ -802,6 +819,43 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
         # Todo:↑にfile_groupだけではなくlib_groupも追加して解決してやる必要があるのでは？
         #      file_groupの要素にimportsも入っているので大丈夫のはず。
         
+
+    # Argument-propagation heuristic: if a call passes a function name as a
+    # positional arg into another function (e.g. `trace(do_something)`), then
+    # propagate that argument into the callee's parameter variable so that
+    # later `fn()` calls inside the callee can resolve to the passed function.
+    if _HEURISTICS_ENABLED:
+        for node in all_nodes:
+            if not node.calls:
+                continue
+            for call in node.calls:
+                arg_tokens = getattr(call, 'arg_tokens', None) or []
+                if not arg_tokens:
+                    continue
+                # Find the target function node for this call (simple file-level match)
+                candidates = [n for n in all_nodes if n.token == call.token and isinstance(n.parent, Group) and n.parent.group_type == GROUP_TYPE.FILE]
+                if len(candidates) != 1:
+                    continue
+                target = candidates[0]
+                param_tokens = getattr(target, 'param_tokens', [])
+                if not param_tokens:
+                    continue
+                # Map positional args -> params by index
+                for i, arg_tok in enumerate(arg_tokens):
+                    if i >= len(param_tokens):
+                        break
+                    param_name = param_tokens[i]
+                    # find a node that matches the argument token
+                    arg_node = next((n for n in all_nodes if n.token == arg_tok), None)
+                    if not arg_node:
+                        continue
+                    # find the variable in the target function for this parameter
+                    if target.variables:
+                        for var in target.variables:
+                            if var.token == param_name:
+                                var.points_to = arg_node
+                                logging.debug(f"[arg-prop] Propagated arg {arg_tok} -> {target.token}.{param_name}")
+                                break
 
     # Not a step. Just log what we know so far
     logging.info("Found groups %r." % [g.label() for g in all_subgroups])
@@ -1114,7 +1168,8 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
               exclude_namespaces=None, exclude_functions=None,
               include_only_namespaces=None, include_only_functions=None,
               no_grouping=False, no_trimming=False, skip_parse_errors=False,
-              lang_params=None, subset_params=None, alias_labels=False, level=logging.INFO):
+              lang_params=None, subset_params=None, alias_labels=False, level=logging.INFO,
+              heuristics=True):
     """
     Top-level function. Generate a diagram based on source code.
     Can generate either a dotfile or an image.
@@ -1188,7 +1243,7 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
                                            exclude_namespaces, exclude_functions,
                                            include_only_namespaces, include_only_functions,
                                            skip_parse_errors, lang_params,
-                                           alias_labels=alias_labels)
+                                           alias_labels=alias_labels, heuristics=heuristics)
 
     if subset_params:
         logging.info("Filtering into subset...")
@@ -1294,6 +1349,13 @@ def main(sys_argv=None):
         '--alias-labels', action='store_true',
         help='エッジに変数エイリアス経由の呼び出しをラベル表示します (例: as abra3()).')
     parser.add_argument(
+        '--heuristics', dest='heuristics', action='store_true',
+        help='Enable resolution heuristics (recursive local imports, inheritance-aware self resolution).')
+    parser.add_argument(
+        '--no-heuristics', dest='heuristics', action='store_false',
+        help='Disable resolution heuristics; only parse explicit files and do not apply inheritance heuristics.')
+    parser.set_defaults(heuristics=True)
+    parser.add_argument(
         '--version', action='version', version='%(prog)s ' + VERSION)
 
     sys_argv = sys_argv or sys.argv[1:]
@@ -1363,4 +1425,5 @@ def main(sys_argv=None):
         subset_params=subset_params,
         alias_labels=alias_labels,
         level=level,
+        heuristics=args.heuristics,
     )

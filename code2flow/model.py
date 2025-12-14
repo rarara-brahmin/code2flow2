@@ -196,12 +196,14 @@ class Call():
         do_something()
 
     """
-    def __init__(self, token, line_number=None, owner_token=None, definite_constructor=False, is_library=False):
+    def __init__(self, token, line_number=None, owner_token=None, definite_constructor=False, is_library=False, arg_tokens=None):
         self.token = token
         self.owner_token = owner_token
         self.line_number = line_number
         self.definite_constructor = definite_constructor
         self.is_library = is_library
+        # Positional argument tokens captured from the original AST call (names or dotted names)
+        self.arg_tokens = arg_tokens or []
 
     def __repr__(self):
         return f"<Call owner_token={self.owner_token} token={self.token}>"

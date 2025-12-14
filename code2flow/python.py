@@ -6,7 +6,7 @@ from .model import (OWNER_CONST, GROUP_TYPE, Group, Node, Call, Variable,
                     BaseLanguage, djoin)
 
 
-def get_call_from_func_element(func, scope_stack=None):
+def get_call_from_func_element(func, scope_stack=None, call_node=None):
     """
     Given a python ast that represents a function call, clear and create our
     generic Call object. Some calls have no chance at resolution (e.g. array[2](param))
@@ -16,6 +16,27 @@ def get_call_from_func_element(func, scope_stack=None):
     :rtype: Call|None
     """
     assert type(func) in (ast.Attribute, ast.Name, ast.Subscript, ast.Call)
+    # Collect positional argument tokens if a full ast.Call node was provided
+    arg_tokens = []
+    if call_node is not None:
+        for a in getattr(call_node, 'args', []):
+            if isinstance(a, ast.Name):
+                arg_tokens.append(a.id)
+            elif isinstance(a, ast.Attribute):
+                # build dotted attribute name
+                parts = []
+                val = a
+                while True:
+                    try:
+                        parts.append(getattr(val, 'attr', val.id))
+                    except AttributeError:
+                        pass
+                    val = getattr(val, 'value', None)
+                    if not val:
+                        break
+                if parts:
+                    arg_tokens.append(djoin(*reversed(parts)))
+
     if type(func) == ast.Attribute:
         # 型推論によるowner_tokenの解決
         owner_token = OWNER_CONST.UNKNOWN_VAR
@@ -53,9 +74,9 @@ def get_call_from_func_element(func, scope_stack=None):
         is_library = False
         if owner_token and owner_token != OWNER_CONST.UNKNOWN_VAR:
             is_library = True
-        return Call(token=func.attr, line_number=func.lineno, owner_token=owner_token, is_library=is_library)
+        return Call(token=func.attr, line_number=func.lineno, owner_token=owner_token, is_library=is_library, arg_tokens=arg_tokens)
     if type(func) == ast.Name:
-        return Call(token=func.id, line_number=func.lineno)
+        return Call(token=func.id, line_number=func.lineno, arg_tokens=arg_tokens)
     if type(func) in (ast.Subscript, ast.Call):
         return None
 
@@ -74,7 +95,7 @@ def make_calls(lines, scope_stack=None):
         for element in ast.walk(tree):
             if type(element) != ast.Call:
                 continue
-            call = get_call_from_func_element(element.func, scope_stack)
+            call = get_call_from_func_element(element.func, scope_stack, call_node=element)
             if call:
                 calls.append(call)
     return calls
@@ -273,7 +294,10 @@ class Python(BaseLanguage):
             module_scope = getattr(parent.parent, 'module_scope', {}) or {}
         # copy to avoid mutating the shared module scope
         scope_stack = [dict(module_scope), {}]
-        variables = make_local_variables(tree.body, parent, scope_stack)
+        # Include function parameters as variables so they can be resolved/propagated later
+        param_tokens = [arg.arg for arg in getattr(tree.args, 'args', [])]
+        param_vars = [Variable(p, OWNER_CONST.UNKNOWN_VAR, line_number) for p in param_tokens]
+        variables = param_vars + make_local_variables(tree.body, parent, scope_stack)
         calls = make_calls(tree.body, scope_stack)
         is_constructor = False
         if parent.group_type == GROUP_TYPE.CLASS and token in ['__init__', '__new__']:
@@ -283,8 +307,11 @@ class Python(BaseLanguage):
         if parent.group_type == GROUP_TYPE.FILE:
             import_tokens = [djoin(parent.token, token)]
 
-        ret = [Node(token, calls, variables, parent, import_tokens=import_tokens,
-                    line_number=line_number, is_constructor=is_constructor)]
+        node = Node(token, calls, variables, parent, import_tokens=import_tokens,
+                line_number=line_number, is_constructor=is_constructor)
+        # record parameter ordering for argument-propagation heuristic
+        node.param_tokens = param_tokens
+        ret = [node]
         # ToDo: この時点では呼び先の外部モジュールは[Node.calls[n].owner_token]に格納されている。
         #       呼ばれる側の外部モジュールのNodeを作ってやればグラフ化できるはず。
         return ret
