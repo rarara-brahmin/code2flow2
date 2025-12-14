@@ -306,7 +306,7 @@ class Call():
 
 class Node():
     def __init__(self, token, calls, variables, parent, import_tokens=None,
-                 line_number=None, is_constructor=False, is_library=False):
+                 line_number=None, is_constructor=False, is_library=False, missing=False):
         self.token = token
         self.line_number = line_number
         self.calls = calls
@@ -315,6 +315,7 @@ class Node():
         self.parent = parent
         self.is_constructor = is_constructor
         self.is_library = is_library
+        self.missing = missing
 
         self.uid = "node_" + os.urandom(4).hex()
         # ToDo: uidが重複するのを防げない？暗号学的に安全な乱数なので大丈夫かも？
@@ -392,8 +393,12 @@ class Node():
         :rtype: str
         """
         if self.line_number is not None:
-            return f"{self.line_number}: {self.token}()"
-        return f"{self.token}()"
+            base = f"{self.line_number}: {self.token}()"
+        else:
+            base = f"{self.token}()"
+        if getattr(self, 'missing', False):
+            return f"{base} (NotFound)"
+        return base
 
     def remove_from_parent(self):
         """

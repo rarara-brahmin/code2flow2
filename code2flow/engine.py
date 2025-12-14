@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import ast
+import builtins
 
 from .python import Python
 from .model import (TRUNK_COLOR, LEAF_COLOR, NODE_COLOR, GROUP_TYPE, OWNER_CONST,
@@ -572,17 +573,33 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     """
     logging.debug(f"[_find_link_for_call] 呼び出しチェック開始: node_a.token={node_a.token}, call.to_string()={call.to_string()}, call.owner_token={call.owner_token}, call.token={call.token}, call.is_attr()={call.is_attr()}, call.is_library={call.is_library}")
 
-    # 0.5. owner == 'self' の場合、まず呼び元クラスの継承チェーンにあるメソッドを探す
-    # これをライブラリマッチより先に行うことで、継承元に定義されたメソッド
-    # （例: PentatonicScales.pentaNum）を優先して図示できるようにする。
+    # 0.5. owner == 'self' の場合、まず同クラス内のメソッドを探し、なければ継承チェーンを探す
+    # これをライブラリマッチより先に行うことで、同クラスや継承元に定義された
+    # メソッド（例: Abra.cadabra, PentatonicScales.pentaNum）を優先して図示できるようにする。
     if call.is_attr() and call.owner_token == 'self':
         parent_group = getattr(node_a, 'parent', None)
         candidates = []
         if parent_group and getattr(parent_group, 'group_type', None) == GROUP_TYPE.CLASS:
+            # 1) 同クラス内のメソッドを優先
+            for node in getattr(parent_group, 'nodes', []):
+                if node.token == call.token:
+                    candidates.append(node)
+
+            if candidates:
+                # 同クラス内に見つかったら、それを返す（通常は一意）
+                if len(candidates) == 1:
+                    logging.debug(f"[_find_link_for_call] 同クラスによってマッチ: {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
+                    return candidates[0], None, None
+                else:
+                    logging.debug(f"[_find_link_for_call] 同クラス内で複数候補: {[c.token for c in candidates]}")
+                    return None, call, (candidates, [])
+
+            # 2) 継承チェーン内を検索
             for inherit_nodes in getattr(parent_group, 'inherits', []):
                 for candidate in inherit_nodes:
                     if candidate.token == call.token:
                         candidates.append(candidate)
+
         if candidates:
             if len(candidates) == 1:
                 logging.debug(f"[_find_link_for_call] 継承によってマッチ: {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
@@ -798,6 +815,8 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     # すべてのライブラリ呼び出しを収集し、それらのノードを作成する
     library_nodes_by_signature = {}
     library_groups_by_module = {}
+    # Builtin names (e.g. print, len) should be treated as library functions
+    builtin_names = set(dir(builtins))
     
     unflatten_n_calls_all = [n.calls for n in all_nodes if n.calls]
     all_calls = flatten(unflatten_n_calls_all)
@@ -851,6 +870,9 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     # 6. Find all calls between all nodes
     bad_calls = []
     edges = []
+    # Collect synthesized nodes for unresolved calls and place them in a special group
+    missing_nodes_by_key = {}
+    missing_group = Group(token='NotFound', group_type=GROUP_TYPE.FILE, display_type='File', import_tokens=[], line_number=0, parent=None)
     for node_a in list(all_nodes):
         # ToDo: ここのall_nodesに外部モジュールの関数を呼び出している部分が入っていないので入れる。
         links = _find_links(node_a, all_nodes + all_imports)
@@ -858,7 +880,73 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
             if bad_call:
                 bad_calls.append(bad_call)
             if not node_b:
-                continue
+                # If the unresolved call is a builtin function (like `print()`),
+                # synthesize or reuse a library node under the `builtins` module
+                # instead of creating a generic NotFound node.
+                try:
+                    is_builtin = (call.owner_token is None) and (call.token in builtin_names)
+                except Exception:
+                    is_builtin = False
+
+                if is_builtin:
+                    module_name = 'builtins'
+                    lib_sig = djoin(module_name, call.token)
+                    # Ensure a builtin library group exists
+                    if module_name not in library_groups_by_module:
+                        lib_group = Group(
+                            token=module_name,
+                            group_type=GROUP_TYPE.NAMESPACE,
+                            display_type="Library",
+                            import_tokens=[module_name],
+                            line_number=0,
+                            parent=None
+                        )
+                        library_groups_by_module[module_name] = lib_group
+                    lib_group = library_groups_by_module[module_name]
+
+                    # Reuse existing synthesized builtin node if present
+                    if lib_sig in library_nodes_by_signature:
+                        node_b = library_nodes_by_signature[lib_sig]
+                    else:
+                        lib_node = Node(
+                            token=call.token,
+                            calls=[],
+                            variables=None,
+                            parent=lib_group,
+                            import_tokens=[lib_sig],
+                            line_number=call.line_number,
+                            is_constructor=False,
+                            is_library=True
+                        )
+                        lib_group.add_node(lib_node)
+                        library_nodes_by_signature[lib_sig] = lib_node
+                        all_nodes.append(lib_node)
+                        node_b = lib_node
+
+                    # Ensure the builtin library group is attached to a file_group for output
+                    if file_groups and lib_group.parent is None:
+                        file_groups[0].add_subgroup(lib_group)
+                        lib_group.parent = file_groups[0]
+                    # proceed to create edge to node_b (builtin)
+                    
+                else:
+                    # Unresolved call: synthesize a NotFound node and link to it
+                    try:
+                        key = call.to_string()
+                    except Exception:
+                        # Fallback key
+                        key = (call.owner_token + '.' + call.token) if call.owner_token else call.token
+
+                    if key not in missing_nodes_by_key:
+                        missing_node = Node(token=call.token, calls=[], variables=None, parent=missing_group,
+                                            import_tokens=[], line_number=None, is_constructor=False,
+                                            is_library=False, missing=True)
+                        missing_group.add_node(missing_node)
+                        all_nodes.append(missing_node)
+                        missing_nodes_by_key[key] = missing_node
+
+                    node_b = missing_nodes_by_key[key]
+
             edge = Edge(node_a, node_b)
             if alias_labels:
                 try:
@@ -876,6 +964,10 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                     # Be conservative: ignore labeling errors and emit unlabeled edge
                     pass
             edges.append(edge)
+
+    # If we created any missing nodes, ensure their group is included for output
+    if missing_group.nodes:
+        file_groups.append(missing_group)
 
     # 7. Loudly complain about duplicate edges that were skipped
     bad_calls_strings = set()
