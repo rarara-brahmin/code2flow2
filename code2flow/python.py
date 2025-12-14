@@ -408,8 +408,9 @@ class Python(BaseLanguage):
             class_group.add_node(Python.make_nodes(node_tree, parent=class_group)[0])
 
         for subgroup_tree in subgroup_trees:
-            logging.warning("Code2flow does not support nested classes. Skipping %r in %r.",
-                            subgroup_tree.name, parent.token)
+            # Create nested class groups instead of skipping them. Pass the
+            # current class_group as the parent so nesting is preserved.
+            class_group.add_subgroup(Python.make_class_group(subgroup_tree, parent=class_group))
         return class_group
 
     @staticmethod

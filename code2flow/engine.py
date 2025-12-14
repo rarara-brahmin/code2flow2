@@ -602,6 +602,29 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
                     if candidate.token == call.token:
                         candidates.append(candidate)
 
+            # 3) ネストされたクラス（subgroup）を探して、そのコンストラクタを返す
+            for subgroup in getattr(parent_group, 'subgroups', []):
+                if subgroup.token == call.token:
+                    ctor = subgroup.get_constructor()
+                    if ctor:
+                        logging.debug(f"[_find_link_for_call] ネストクラスのコンストラクタによってマッチ: {ctor.token} parent={getattr(ctor.parent,'token',None)}")
+                        return ctor, None, None
+                    else:
+                        # Synthesize a constructor node for the nested class so
+                        # calls like `self.Inner()` can point to `Inner.__init__()`.
+                        synth_ctor = Node(token='__init__', calls=[], variables=None,
+                                         parent=subgroup, import_tokens=[],
+                                         line_number=None, is_constructor=True,
+                                         is_library=False, missing=False)
+                        subgroup.add_node(synth_ctor)
+                        # Add to the global node list so subsequent resolution can find it
+                        try:
+                            all_nodes.append(synth_ctor)
+                        except Exception:
+                            pass
+                        logging.debug(f"[_find_link_for_call] 合成コンストラクタを作成: {synth_ctor.token} parent={subgroup.token}")
+                        return synth_ctor, None, None
+
         if candidates:
             if len(candidates) == 1:
                 logging.debug(f"[_find_link_for_call] 継承によってマッチ: {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
@@ -792,19 +815,42 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     all_imports = flatten(unflatten_g_imports)
 
     nodes_by_subgroup_token = collections.defaultdict(list)
+    # Use hierarchical subgroup keys to avoid token collisions for nested classes.
+    def subgroup_full_token(sg: Group):
+        parts = []
+        cur = sg
+        # Walk up until we reach the file group
+        while cur and getattr(cur, 'group_type', None) != GROUP_TYPE.FILE:
+            parts.insert(0, cur.token)
+            cur = cur.parent
+        if cur and getattr(cur, 'group_type', None) == GROUP_TYPE.FILE:
+            parts.insert(0, cur.token)
+        return djoin(*parts)
+
     for subgroup in all_subgroups:
-        if subgroup.token in nodes_by_subgroup_token:
-            logging.warning("Duplicate group name %r. Naming collision possible.",
-                            subgroup.token)
-        nodes_by_subgroup_token[subgroup.token] += subgroup.nodes
+        full = subgroup_full_token(subgroup)
+        if full in nodes_by_subgroup_token:
+            logging.warning("Duplicate group full token %r. Naming collision possible.", full)
+        nodes_by_subgroup_token[full] += subgroup.nodes
 
     for group in file_groups:
         for subgroup in group.all_groups():
             # Populate inheritance links and inject inherited methods as
             # variables into subclasses only when heuristics are enabled.
             if _HEURISTICS_ENABLED:
-                subgroup.inherits = [nodes_by_subgroup_token.get(g) for g in subgroup.inherits]
-                subgroup.inherits = list(filter(None, subgroup.inherits))
+                resolved_inherits = []
+                for inh in list(subgroup.inherits):
+                    # inh is a bare name (from AST); match against hierarchical keys.
+                    matched = []
+                    for key, nodes_list in nodes_by_subgroup_token.items():
+                        # key endswith the class name?
+                        if key.split('.')[-1] == inh:
+                            matched.append(nodes_list)
+                    if matched:
+                        # flatten matched lists and append
+                        for ml in matched:
+                            resolved_inherits.append(ml)
+                subgroup.inherits = resolved_inherits
                 for inherit_nodes in subgroup.inherits:
                     for node in subgroup.nodes:
                         node.variables += [Variable(n.token, n, n.line_number) for n in inherit_nodes]
