@@ -152,9 +152,9 @@ def make_local_variables(lines, parent, scope_stack=None):
     :rtype: list[Variable]
     """
     variables = []
-        # Initialize scope_stack if not provided.
-        if scope_stack is None:
-            scope_stack = [dict()]  # グローバルスコープ
+    # Initialize scope_stack if not provided.
+    if scope_stack is None:
+        scope_stack = [dict()]  # グローバルスコープ
     for tree in lines:
         for element in ast.walk(tree):
             if type(element) == ast.Assign:
@@ -166,12 +166,10 @@ def make_local_variables(lines, parent, scope_stack=None):
         # Ensure 'self' is present in the scope mapping so attribute calls
         # like self.foo() can have owner_token resolved as the variable name
         # (handled in get_call_from_func_element).
-            # Ensure 'self' exists in the scope for method resolution when parsing
-            # inside class methods. This allows calls like `self.foo()` to be
-            # resolved via variable-based matching. Initialize if needed.
-            if scope_stack is None:
-                scope_stack = [dict()]
-            scope_stack[-1].setdefault('self', 'self')
+        # Ensure 'self' exists in the scope for method resolution when parsing
+        # inside class methods. This allows calls like `self.foo()` to be
+        # resolved via variable-based matching.
+        scope_stack[-1].setdefault('self', 'self')
 
     variables = list(filter(None, variables))
     # Trueとなるオブジェクトのみを取り出して再リスト化

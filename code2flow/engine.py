@@ -572,9 +572,25 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     """
     logging.debug(f"[_find_link_for_call] 呼び出しチェック開始: node_a.token={node_a.token}, call.to_string()={call.to_string()}, call.owner_token={call.owner_token}, call.token={call.token}, call.is_attr()={call.is_attr()}, call.is_library={call.is_library}")
 
-    # ToDo: ここで呼び元の解析を行って変数をリストアップしているっぽい？
-    #   ⇒ここではcall.line_numberが特定されているのでこれより前のcallを登録する部分に手を入れないとダメでは？
-    #   ⇒node_a(token=print_hi).calls[1]でowner_tokenがrequestsになっているので登録はされている。
+    # 0.5. owner == 'self' の場合、まず呼び元クラスの継承チェーンにあるメソッドを探す
+    # これをライブラリマッチより先に行うことで、継承元に定義されたメソッド
+    # （例: PentatonicScales.pentaNum）を優先して図示できるようにする。
+    if call.is_attr() and call.owner_token == 'self':
+        parent_group = getattr(node_a, 'parent', None)
+        candidates = []
+        if parent_group and getattr(parent_group, 'group_type', None) == GROUP_TYPE.CLASS:
+            for inherit_nodes in getattr(parent_group, 'inherits', []):
+                for candidate in inherit_nodes:
+                    if candidate.token == call.token:
+                        candidates.append(candidate)
+        if candidates:
+            if len(candidates) == 1:
+                logging.debug(f"[_find_link_for_call] 継承によってマッチ: {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
+                return candidates[0], None, None
+            else:
+                logging.debug(f"[_find_link_for_call] 継承候補が複数見つかりました: {[c.token for c in candidates]}")
+                return None, call, (candidates, [])
+
     # 1. 直接のライブラリ呼び出しをチェック（例：argparse.ArgumentParser()）
     lib_node = _find_library_node_by_signature(call, all_nodes)
     if lib_node:
