@@ -49,10 +49,36 @@ def parse_file_recursive(file_path, base_dir, parsed_files, language_ext):
                 if dep_path:
                     groups += parse_file_recursive(dep_path, base_dir, parsed_files, language_ext)
         elif isinstance(node, ast.ImportFrom):
+            # Handle ImportFrom in several cases:
+            # 1) node.module present and resolveable by dotted name
+            # 2) node.module present but not resolveable: try each alias as a local module
+            # 3) node.module is None (relative import like `from . import name`): try alias in base_dir
             if node.module:
                 dep_path = resolve_import_path(node.module, base_dir)
                 if dep_path:
                     groups += parse_file_recursive(dep_path, base_dir, parsed_files, language_ext)
+                else:
+                    # module couldn't be resolved as dotted path; try alias names as local modules
+                    for alias in node.names:
+                        candidate = resolve_import_path(alias.name, base_dir)
+                        if candidate:
+                            groups += parse_file_recursive(candidate, base_dir, parsed_files, language_ext)
+            else:
+                # Relative import or `from . import name`.
+                for alias in node.names:
+                    candidate = os.path.join(base_dir, alias.name) + '.py'
+                    if os.path.exists(candidate):
+                        groups += parse_file_recursive(candidate, base_dir, parsed_files, language_ext)
+                        continue
+                    # Support explicit relative levels if present (node.level)
+                    level = getattr(node, 'level', 0) or 0
+                    if level:
+                        cur = base_dir
+                        for _ in range(level):
+                            cur = os.path.dirname(cur)
+                        parent_candidate = os.path.join(cur, alias.name) + '.py'
+                        if os.path.exists(parent_candidate):
+                            groups += parse_file_recursive(parent_candidate, base_dir, parsed_files, language_ext)
 
     return groups
 
@@ -634,7 +660,8 @@ def _find_links(node_a: Node, all_nodes):
             pass
 
         _possible_node, _call, _nodes = _find_link_for_call(call, node_a, all_nodes)
-        lfc = (_possible_node, _call)
+        # Return triple: (resolved_node_or_None, bad_call_or_None, original_call)
+        lfc = (_possible_node, _call, call)
         assert not isinstance(lfc, Group)
         links.append(lfc)
     return list(filter(None, links))
@@ -642,7 +669,7 @@ def _find_links(node_a: Node, all_nodes):
 
 def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_functions,
            include_only_namespaces, include_only_functions,
-           skip_parse_errors, lang_params):
+           skip_parse_errors, lang_params, alias_labels=False):
     """
     Given a language implementation and a list of filenames, do these things:
     1. Read/parse source ASTs
@@ -811,12 +838,28 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     for node_a in list(all_nodes):
         # ToDo: ここのall_nodesに外部モジュールの関数を呼び出している部分が入っていないので入れる。
         links = _find_links(node_a, all_nodes + all_imports)
-        for node_b, bad_call in links:
+        for node_b, bad_call, call in links:
             if bad_call:
                 bad_calls.append(bad_call)
             if not node_b:
                 continue
-            edges.append(Edge(node_a, node_b))
+            edge = Edge(node_a, node_b)
+            if alias_labels:
+                try:
+                    if call and not call.is_attr():
+                        # Name call like `abra3()` — find matching variable in scope
+                        vars_at_line = node_a.get_variables(call.line_number)
+                        for var in vars_at_line:
+                            if var.token == call.token:
+                                # If the variable points to the node we're linking to,
+                                # annotate the edge with the alias used.
+                                if var.points_to == node_b or (isinstance(var.points_to, Group) and node_b in var.points_to.all_nodes()):
+                                    edge.label = f"as {call.token}()"
+                                    break
+                except Exception:
+                    # Be conservative: ignore labeling errors and emit unlabeled edge
+                    pass
+            edges.append(edge)
 
     # 7. Loudly complain about duplicate edges that were skipped
     bad_calls_strings = set()
@@ -963,7 +1006,7 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
               exclude_namespaces=None, exclude_functions=None,
               include_only_namespaces=None, include_only_functions=None,
               no_grouping=False, no_trimming=False, skip_parse_errors=False,
-              lang_params=None, subset_params=None, level=logging.INFO):
+              lang_params=None, subset_params=None, alias_labels=False, level=logging.INFO):
     """
     Top-level function. Generate a diagram based on source code.
     Can generate either a dotfile or an image.
@@ -1036,7 +1079,8 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
     file_groups, all_nodes, edges = map_it(sources, language, no_trimming,
                                            exclude_namespaces, exclude_functions,
                                            include_only_namespaces, include_only_functions,
-                                           skip_parse_errors, lang_params)
+                                           skip_parse_errors, lang_params,
+                                           alias_labels=alias_labels)
 
     if subset_params:
         logging.info("Filtering into subset...")
@@ -1139,6 +1183,9 @@ def main(sys_argv=None):
         '--verbose', '-v', action='store_true',
         help='add more logging')
     parser.add_argument(
+        '--alias-labels', action='store_true',
+        help='エッジに変数エイリアス経由の呼び出しをラベル表示します (例: as abra3()).')
+    parser.add_argument(
         '--version', action='version', version='%(prog)s ' + VERSION)
 
     sys_argv = sys_argv or sys.argv[1:]
@@ -1185,6 +1232,8 @@ def main(sys_argv=None):
     subset_params = SubsetParams.generate(args.target_function, args.upstream_depth,
                                           args.downstream_depth)
 
+    alias_labels = bool(getattr(args, 'alias_labels', False))
+
     # If the user passed an explicit level via key=value on the command line,
     # prefer that over --verbose/--quiet computed value.
     if explicit_level is not None:
@@ -1204,5 +1253,6 @@ def main(sys_argv=None):
         skip_parse_errors=args.skip_parse_errors,
         lang_params=lang_params,
         subset_params=subset_params,
+        alias_labels=alias_labels,
         level=level,
     )

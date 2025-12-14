@@ -59,8 +59,15 @@ def flatten(list_of_lists):
     :param list[list[Value]] list_of_lists:
     :rtype: list[Value]
     """
-    return [el for sublist in list_of_lists for el in sublist]
+    el_list = []
+    for sublist in list_of_lists:
+        if sublist is None:
+            continue
+        for el in sublist:
+            el_list.append(el)
+    # return [el for sublist in list_of_lists for el in sublist]
 
+    return el_list
 
 def _resolve_str_variable(variable, file_groups):
     """
@@ -239,6 +246,8 @@ class Call():
         if variable.token == "req":
             pass
             # デバッグ用。ブレイクポイントいらなくなったら消す。
+        elif self.is_attr():
+            pass
 
         if self.is_attr():
             # ToDo: このowner_token == variable.tokenという判定がライブラリの呼び出しを誤判定させている？
@@ -489,6 +498,8 @@ class Edge():
     def __init__(self, node0: Node, node1: Node):
         self.node0: Node = node0
         self.node1: Node = node1
+        # Optional label to display on the edge (e.g. "as abra3()")
+        self.label = None
 
         # When we draw the edge, we know the calling function is definitely not a leaf...
         # and the called function is definitely not a trunk
@@ -511,7 +522,12 @@ class Edge():
         '''
         ret = self.node0.uid + ' -> ' + self.node1.uid
         source_color = int(self.node0.uid.split("_")[-1], 16) % len(EDGE_COLORS)
-        ret += f' [color="{EDGE_COLORS[source_color]}" penwidth="2"]'
+        attrs = f'color="{EDGE_COLORS[source_color]}" penwidth="2"'
+        if self.label:
+            # escape double quotes in label if any
+            lbl = str(self.label).replace('"', '\\"')
+            attrs += f' label="{lbl}"'
+        ret += f' [{attrs}]'
         return ret
 
     def to_dict(self):
@@ -530,7 +546,7 @@ class Group():
     Groups represent namespaces (classes and modules/files)
     """
     def __init__(self, token, group_type, display_type, import_tokens=None,
-                 line_number=None, parent=None, inherits=None):
+                line_number=None, parent=None, inherits=None):
         self.token = token
         self.line_number = line_number
         self.nodes = []
@@ -557,6 +573,9 @@ class Group():
         Labels are what you see on the graph
         :rtype: str
         """
+        # ライブラリグループの場合、ライブラリ名を明確に表示する
+        if self.display_type == "Library":
+            return f"Library: {self.token}"
         return f"{self.display_type}: {self.token}"
 
     def filename(self):

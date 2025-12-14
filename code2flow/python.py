@@ -23,7 +23,15 @@ def get_call_from_func_element(func, scope_stack=None):
             var_name = func.value.id
             for scope in reversed(scope_stack):
                 if var_name in scope:
-                    owner_token = scope[var_name]
+                    val = scope[var_name]
+                    # If the scope mapping stores a string, treat it as a module/type
+                    # name and use that. If it's a non-string (e.g. Group/Node), or
+                    # we want variable-based resolution, use the variable name so
+                    # later matching against variable.token works.
+                    if isinstance(val, str):
+                        owner_token = val
+                    else:
+                        owner_token = var_name
                     break
         else:
             # 従来のowner_token構築ロジック
@@ -144,8 +152,9 @@ def make_local_variables(lines, parent, scope_stack=None):
     :rtype: list[Variable]
     """
     variables = []
-    if scope_stack is None:
-        scope_stack = [{}]  # グローバルスコープ
+        # Initialize scope_stack if not provided.
+        if scope_stack is None:
+            scope_stack = [dict()]  # グローバルスコープ
     for tree in lines:
         for element in ast.walk(tree):
             if type(element) == ast.Assign:
@@ -154,6 +163,15 @@ def make_local_variables(lines, parent, scope_stack=None):
                 variables += process_import(element, scope_stack)
     if parent.group_type == GROUP_TYPE.CLASS:
         variables.append(Variable('self', parent, lines[0].lineno))
+        # Ensure 'self' is present in the scope mapping so attribute calls
+        # like self.foo() can have owner_token resolved as the variable name
+        # (handled in get_call_from_func_element).
+            # Ensure 'self' exists in the scope for method resolution when parsing
+            # inside class methods. This allows calls like `self.foo()` to be
+            # resolved via variable-based matching. Initialize if needed.
+            if scope_stack is None:
+                scope_stack = [dict()]
+            scope_stack[-1].setdefault('self', 'self')
 
     variables = list(filter(None, variables))
     # Trueとなるオブジェクトのみを取り出して再リスト化
