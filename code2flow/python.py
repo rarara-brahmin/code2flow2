@@ -76,6 +76,22 @@ def get_call_from_func_element(func, scope_stack=None, call_node=None):
             is_library = True
         return Call(token=func.attr, line_number=func.lineno, owner_token=owner_token, is_library=is_library, arg_tokens=arg_tokens)
     if type(func) == ast.Name:
+        # If the name is an imported symbol that maps to a dotted module
+        # path recorded in the scope (e.g. `search -> 're.search'`), treat
+        # this as an attribute call so resolution can find the library
+        # node (owner_token='re', token='search'). This handles both
+        # `from re import search` and `import re.match as mitch` patterns.
+        if scope_stack is not None:
+            for scope in reversed(scope_stack):
+                if func.id in scope:
+                    val = scope[func.id]
+                    if isinstance(val, str) and '.' in val:
+                        module, attr = val.rsplit('.', 1)
+                        return Call(token=attr, line_number=func.lineno,
+                                    owner_token=module, is_library=True,
+                                    arg_tokens=arg_tokens)
+                    # If the mapping isn't a dotted string, fall through
+                    break
         return Call(token=func.id, line_number=func.lineno, arg_tokens=arg_tokens)
     # Handle subscript calls like `func_dict['name']()` by resolving the
     # subscript against scope_stack mappings created by `process_assign`.
