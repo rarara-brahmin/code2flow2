@@ -19,6 +19,7 @@ class Namespace(dict):
         d.update(dict(kwargs.items()))
         super().__init__(d)
 
+
     def __getattr__(self, item):
         return self[item]
 
@@ -58,8 +59,15 @@ def flatten(list_of_lists):
     :param list[list[Value]] list_of_lists:
     :rtype: list[Value]
     """
-    return [el for sublist in list_of_lists for el in sublist]
+    el_list = []
+    for sublist in list_of_lists:
+        if sublist is None:
+            continue
+        for el in sublist:
+            el_list.append(el)
+    # return [el for sublist in list_of_lists for el in sublist]
 
+    return el_list
 
 def _resolve_str_variable(variable, file_groups):
     """
@@ -74,12 +82,16 @@ def _resolve_str_variable(variable, file_groups):
     :rtype: Node|Group|str
     """
     for file_group in file_groups:
-        for node in file_group.all_nodes():
+        all_nodes = file_group.all_nodes()
+        for node in all_nodes:
             if any(ot == variable.points_to for ot in node.import_tokens):
                 return node
-        for group in file_group.all_groups():
+
+        all_groups = file_group.all_groups()
+        for group in all_groups:
             if any(ot == variable.points_to for ot in group.import_tokens):
                 return group
+
     return OWNER_CONST.UNKNOWN_MODULE
 
 
@@ -184,11 +196,14 @@ class Call():
         do_something()
 
     """
-    def __init__(self, token, line_number=None, owner_token=None, definite_constructor=False):
+    def __init__(self, token, line_number=None, owner_token=None, definite_constructor=False, is_library=False, arg_tokens=None):
         self.token = token
         self.owner_token = owner_token
         self.line_number = line_number
         self.definite_constructor = definite_constructor
+        self.is_library = is_library
+        # Positional argument tokens captured from the original AST call (names or dotted names)
+        self.arg_tokens = arg_tokens or []
 
     def __repr__(self):
         return f"<Call owner_token={self.owner_token} token={self.token}>"
@@ -212,6 +227,13 @@ class Call():
 
     def matches_variable(self, variable):
         """
+        この変数が呼び出しの対象であるかどうかを確認する。
+        例えば'obj'という変数が以下の式から生成され、
+            obj = Obj()
+        以下のように呼び出された場合、
+            obj.do_something()
+        do_somethingノードがobjからリターンされる。
+
         Check whether this variable is what the call is acting on.
         For example, if we had 'obj' from
             obj = Obj()
@@ -223,17 +245,42 @@ class Call():
         :rtype: Node
         """
 
+        if variable.token == "req":
+            pass
+            # デバッグ用。ブレイクポイントいらなくなったら消す。
+        elif self.is_attr():
+            pass
+
         if self.is_attr():
-            if self.owner_token == variable.token:
+            # ToDo: このowner_token == variable.tokenという判定がライブラリの呼び出しを誤判定させている？
+            #    ライブラリの呼び出しはvar = lib_name.func_name()という形になるので上記が真にならない？
+            #    (ライブラリ呼び出し時はowner_token: lib_name, variable.token: varになる）
+            #    このowner_tokenというのはどこで入力されるのか。
+            #    ⇒owner_tokenはpython.py get_call_from_func_element()で格納されている。
+            #      格納対象はCallクラスのfuncプロパティ(Name型)のidプロパティである。
+            #      https://docs.python.org/3/library/ast.html#ast.Call
+            if self.owner_token == variable.token or self.is_library:
+                # ToDo: owner_token == variable.tokenの条件を満たしていなくても通してよいケースとは？
+                #   ⇒ライブラリの呼び出しである場合。
+                #    ライブラリの一覧を持っておいてowner_tokenと照合する？
+                #    Callの中にライブラリか否かの情報を持っておけないだろうか？
+                #   ⇒持たせてみた
                 for node in getattr(variable.points_to, 'nodes', []):
+                    # variable.point_toオブジェクトのnodes属性(nodeのリスト?)を取り出す。
                     if self.token == node.token:
                         return node
+
                 for inherit_nodes in getattr(variable.points_to, 'inherits', []):
                     for node in inherit_nodes:
                         if self.token == node.token:
                             return node
+
                 if variable.points_to in OWNER_CONST:
                     return variable.points_to
+
+                # ToDo:requests.getをNodeとして返してあげる処理を書く必要あり。
+
+
 
             # This section is specifically for resolving namespace variables
             if isinstance(variable.points_to, Group) \
@@ -261,7 +308,8 @@ class Call():
 
 class Node():
     def __init__(self, token, calls, variables, parent, import_tokens=None,
-                 line_number=None, is_constructor=False):
+                 line_number=None, is_constructor=False, is_library=False, missing=False,
+                 implicit_constructor=False):
         self.token = token
         self.line_number = line_number
         self.calls = calls
@@ -269,8 +317,14 @@ class Node():
         self.import_tokens = import_tokens or []
         self.parent = parent
         self.is_constructor = is_constructor
+        self.is_library = is_library
+        self.missing = missing
+        # New flag: True if this constructor node was implicitly synthesized
+        # because the class was instantiated but no explicit __init__ exists.
+        self.implicit_constructor = implicit_constructor
 
         self.uid = "node_" + os.urandom(4).hex()
+        # ToDo: uidが重複するのを防げない？暗号学的に安全な乱数なので大丈夫かも？
 
         # Assume it is a leaf and a trunk. These are modified later
         self.is_leaf = True  # it calls nothing else
@@ -345,8 +399,20 @@ class Node():
         :rtype: str
         """
         if self.line_number is not None:
-            return f"{self.line_number}: {self.token}()"
-        return f"{self.token}()"
+            base = f"{self.line_number}: {self.token}()"
+        else:
+            base = f"{self.token}()"
+        # If this node represents an implicit constructor synthesized by the
+        # resolver, show a clearer label such as "__init__ (implicit constructor)".
+        if getattr(self, 'implicit_constructor', False):
+            # strip trailing parentheses for readability
+            if base.endswith('()'):
+                base = base[:-2]
+            return f"{base} (implicit constructor)"
+
+        if getattr(self, 'missing', False):
+            return f"{base} (NotFound)"
+        return base
 
     def remove_from_parent(self):
         """
@@ -398,6 +464,10 @@ class Node():
                     for group in file_group.all_groups():
                         if group.token == call.token:
                             variable.points_to = group
+            elif isinstance(variable.points_to, dict):
+                # dict literal mappings are left as-is for subscript-call resolution
+                # (handled by Python.get_call_from_func_element using scope_stack)
+                continue
             else:
                 assert isinstance(variable.points_to, (Node, Group))
 
@@ -448,9 +518,11 @@ def _wrap_as_variables(sequence):
 
 
 class Edge():
-    def __init__(self, node0, node1):
-        self.node0 = node0
-        self.node1 = node1
+    def __init__(self, node0: Node, node1: Node):
+        self.node0: Node = node0
+        self.node1: Node = node1
+        # Optional label to display on the edge (e.g. "as abra3()")
+        self.label = None
 
         # When we draw the edge, we know the calling function is definitely not a leaf...
         # and the called function is definitely not a trunk
@@ -473,7 +545,12 @@ class Edge():
         '''
         ret = self.node0.uid + ' -> ' + self.node1.uid
         source_color = int(self.node0.uid.split("_")[-1], 16) % len(EDGE_COLORS)
-        ret += f' [color="{EDGE_COLORS[source_color]}" penwidth="2"]'
+        attrs = f'color="{EDGE_COLORS[source_color]}" penwidth="2"'
+        if self.label:
+            # escape double quotes in label if any
+            lbl = str(self.label).replace('"', '\\"')
+            attrs += f' label="{lbl}"'
+        ret += f' [{attrs}]'
         return ret
 
     def to_dict(self):
@@ -492,7 +569,7 @@ class Group():
     Groups represent namespaces (classes and modules/files)
     """
     def __init__(self, token, group_type, display_type, import_tokens=None,
-                 line_number=None, parent=None, inherits=None):
+                line_number=None, parent=None, inherits=None):
         self.token = token
         self.line_number = line_number
         self.nodes = []
@@ -503,6 +580,7 @@ class Group():
         self.display_type = display_type
         self.import_tokens = import_tokens or []
         self.inherits = inherits or []
+        self.imports = []
         assert group_type in GROUP_TYPE
 
         self.uid = "cluster_" + os.urandom(4).hex()  # group doesn't work by syntax rules
@@ -518,6 +596,9 @@ class Group():
         Labels are what you see on the graph
         :rtype: str
         """
+        # ライブラリグループの場合、ライブラリ名を明確に表示する
+        if self.display_type == "Library":
+            return f"Library: {self.token}"
         return f"{self.display_type}: {self.token}"
 
     def filename(self):
@@ -546,6 +627,9 @@ class Group():
         if is_root:
             self.root_node = node
 
+    def add_import(self, import_module):
+        self.imports.append(import_module)
+
     def all_nodes(self):
         """
         List of nodes that are part of this group + all subgroups
@@ -554,6 +638,16 @@ class Group():
         ret = list(self.nodes)
         for subgroup in self.subgroups:
             ret += subgroup.all_nodes()
+        return ret
+
+    def all_imports(self):
+        """
+        List of nodes that are part of this group + all subgroups
+        :rtype: list[Node]
+        """
+        ret = list(self.imports)
+        for subgroup in self.subgroups:
+            ret += subgroup.all_imports()
         return ret
 
     def get_constructor(self):

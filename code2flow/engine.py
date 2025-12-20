@@ -6,13 +6,85 @@ import os
 import subprocess
 import sys
 import time
+import ast
+import builtins
 
 from .python import Python
-from .javascript import Javascript
-from .ruby import Ruby
-from .php import PHP
 from .model import (TRUNK_COLOR, LEAF_COLOR, NODE_COLOR, GROUP_TYPE, OWNER_CONST,
-                    Edge, Group, Node, Variable, is_installed, flatten)
+                    Edge, Group, Node, Variable, is_installed, flatten, Call, djoin)
+
+# Global switch to enable/disable heuristic resolution features.
+# Controlled by CLI flag --heuristics / --no-heuristics (default: enabled).
+_HEURISTICS_ENABLED = True
+
+def resolve_import_path(module_name, base_dir):
+    """Resolve a dotted module name to a local .py file under base_dir.
+
+    Example: 'exclude_modules_b' -> '<base_dir>/exclude_modules_b.py'
+    """
+    parts = module_name.split('.')
+    candidate = os.path.join(base_dir, *parts) + '.py'
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+
+def parse_file_recursive(file_path, base_dir, parsed_files, language_ext):
+    """Parse a file and recursively parse local imports, returning a list of Groups.
+
+    Keeps track of parsed files in `parsed_files` to avoid cycles.
+    """
+    if file_path in parsed_files:
+        return []
+    parsed_files.add(file_path)
+
+    with open(file_path, encoding='utf-8') as f:
+        tree = ast.parse(f.read())
+
+    # Create the file group for this file
+    file_group = make_file_group(tree, file_path, language_ext)
+    groups = [file_group]
+
+    # Walk AST for import statements and recurse for local modules
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                dep_path = resolve_import_path(alias.name, base_dir)
+                if dep_path:
+                    groups += parse_file_recursive(dep_path, base_dir, parsed_files, language_ext)
+        elif isinstance(node, ast.ImportFrom):
+            # Handle ImportFrom in several cases:
+            # 1) node.module present and resolveable by dotted name
+            # 2) node.module present but not resolveable: try each alias as a local module
+            # 3) node.module is None (relative import like `from . import name`): try alias in base_dir
+            if node.module:
+                dep_path = resolve_import_path(node.module, base_dir)
+                if dep_path:
+                    groups += parse_file_recursive(dep_path, base_dir, parsed_files, language_ext)
+                else:
+                    # module couldn't be resolved as dotted path; try alias names as local modules
+                    for alias in node.names:
+                        candidate = resolve_import_path(alias.name, base_dir)
+                        if candidate:
+                            groups += parse_file_recursive(candidate, base_dir, parsed_files, language_ext)
+            else:
+                # Relative import or `from . import name`.
+                for alias in node.names:
+                    candidate = os.path.join(base_dir, alias.name) + '.py'
+                    if os.path.exists(candidate):
+                        groups += parse_file_recursive(candidate, base_dir, parsed_files, language_ext)
+                        continue
+                    # Support explicit relative levels if present (node.level)
+                    level = getattr(node, 'level', 0) or 0
+                    if level:
+                        cur = base_dir
+                        for _ in range(level):
+                            cur = os.path.dirname(cur)
+                        parent_candidate = os.path.join(cur, alias.name) + '.py'
+                        if os.path.exists(parent_candidate):
+                            groups += parse_file_recursive(parent_candidate, base_dir, parsed_files, language_ext)
+
+    return groups
 
 VERSION = '2.5.1'
 
@@ -41,10 +113,6 @@ LEGEND = """subgraph legend{
 
 LANGUAGES = {
     'py': Python,
-    'js': Javascript,
-    'mjs': Javascript,
-    'rb': Ruby,
-    'php': PHP,
 }
 
 
@@ -295,10 +363,18 @@ def get_sources_and_language(raw_source_paths, language):
 
     individual_files = []
     for source in sorted(raw_source_paths):
+        # raw_source_paths内のファイル/フォルダのツリーリストを作成する。
         if os.path.isfile(source):
             individual_files.append((source, True))
+            # ToDo: individual_filesの要素のTrue/Falseはどういう意味？
+            #  raw_source_paths直下にあるファイルのみTrue？
+            #  そこを区別する必要性は何？
             continue
         for root, _, files in os.walk(source):
+            # os.walkは引数のディレクトリ内を再帰的に走査して
+            # 各ディレクトリ(top自身を含む)ごとに、タプル(dirpath, dirnames, filenames)をyieldする。
+            # sourceがファイルの場合は上でcontinueされているので、ここを通るsourceはすべてディレクトリ。
+            # https://docs.python.org/ja/3/library/os.html#os.walk
             for f in files:
                 individual_files.append((os.path.join(root, f), False))
 
@@ -308,10 +384,15 @@ def get_sources_and_language(raw_source_paths, language):
 
     if not language:
         language = determine_language(individual_files)
+        # 起動時に言語が指定されていない場合はここで決定(推定)する。
+        # ToDo: Expected type 'list[str]', got 'list[tuple[str, bool]]' instead
+        #  という警告が出ている。それはそうなんだけどdetermine_languageではどう使われてんだろうか。
 
     sources = set()
     for source, explicity_added in individual_files:
         if explicity_added or source.endswith('.' + language):
+            # raw_source_paths直下にあるファイルとターゲット言語のソースファイルをsourcesに加える。
+            # ToDo: ここsetなの？ 別階層に同名のファイルあったらゴチャゴチャにならんかね。
             sources.add(source)
         else:
             logging.info("Skipping %r which is not a %s file. "
@@ -330,12 +411,12 @@ def get_sources_and_language(raw_source_paths, language):
     return sources, language
 
 
-def make_file_group(tree, filename, extension):
+def make_file_group(tree: ast.AST, filename: str, extension: str) -> Group:
     """
     Given an AST for the entire file, generate a file group complete with
     subgroups, nodes, etc.
 
-    :param tree ast:
+    :param tree ast.AST:
     :param filename str:
     :param extension str:
 
@@ -343,7 +424,11 @@ def make_file_group(tree, filename, extension):
     """
     language = LANGUAGES[extension]
 
-    subgroup_trees, node_trees, body_trees = language.separate_namespaces(tree)
+    # ToDo: tree.body[4].body[1].targets[0].idにreqが格納されている。
+    #   reqではなくrequest.getをnode_trees内にNodeとして登録したい。
+    subgroup_trees, node_trees, body_trees, import_tree = language.separate_namespaces(tree)
+    # tree内のast要素を分類してリストにして返す。
+
     group_type = GROUP_TYPE.FILE
     token = os.path.split(filename)[-1].rsplit('.' + extension, 1)[0]
     line_number = 0
@@ -352,21 +437,135 @@ def make_file_group(tree, filename, extension):
 
     file_group = Group(token, group_type, display_name, import_tokens,
                        line_number, parent=None)
+
+    # Include import statements in the root node lines so module-level
+    # imports are recorded into the module scope (used when resolving
+    # names inside functions). Create the root node first so subsequent
+    # function nodes can inherit the module scope.
+    root_lines = list(body_trees) + list(import_tree)
+    file_group.add_node(language.make_root_node(root_lines, parent=file_group), is_root=True)
+
     for node_tree in node_trees:
+        # node_treeはast.FunctionDef or ast.AsyncFunctionDef
         for new_node in language.make_nodes(node_tree, parent=file_group):
             file_group.add_node(new_node)
 
-    file_group.add_node(language.make_root_node(body_trees, parent=file_group), is_root=True)
-
     for subgroup_tree in subgroup_trees:
         file_group.add_subgroup(language.make_class_group(subgroup_tree, parent=file_group))
+
+    # for import_module in import_tree:
+    #     # ToDo: importモジュールを取り出してリストに詰めるが、これでいいのかというと？？？
+    #     file_group.add_import(import_module.names[0])
+    for import_module in import_tree:
+        for new_node in language.make_import_module_nodes(import_module, parent=file_group):
+            # file_group.add_import(new_node)
+            file_group.add_node(new_node)
+    # Todo: import_treeはast.Import（ast.FunctionDefとの構造の違いに注意）
+    #  なのでこれをdot言語に起こせるように成形してNodeに詰める。
+    #  dot言語作成時に読む属性はlabel, name, shape, style, fillcolor
+    #  （詳細はmodel.py Node.to_dot()参照）
+    #  add_node(new_node)では、new_node側にNodeの構造を持たせて、add_nodeはlistにappendしているだけ。
+    #  Nodeの構造はPython.make_nodes()参照。
+
     return file_group
 
 
-def _find_link_for_call(call, node_a, all_nodes):
+def _find_library_node_by_signature(call: Call, all_nodes: list[Node]) -> Node:
+    """
+    ライブラリ呼び出しに対応するライブラリノードを検索する
+    
+    :param call Call: ライブラリ呼び出し
+    :param all_nodes list[Node]: すべてのノード
+    :rtype: Node|None
+    """
+    if not (call.is_library and call.is_attr() and call.owner_token):
+        return None
+    
+    lib_signature = djoin(call.owner_token, call.token)
+    module_name = call.owner_token.split('.')[0] if '.' in call.owner_token else call.owner_token
+
+    # Debug: list candidate nodes that share the token
+    candidates = [n for n in all_nodes if n.token == call.token]
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(f"[_find_library_node_by_signature] lib_signature={lib_signature} module_name={module_name} candidates={[(n.token, getattr(n.parent,'token',None), n.import_tokens, n.is_library) for n in candidates]}")
+
+    # Prefer concrete nodes (from parsed files) whose import_tokens match the signature
+    # or whose parent module name matches. Do not restrict to node.is_library; real
+    # file nodes should be considered first to avoid misattributing calls to libraries
+    # when a local module defines the same function name.
+    for node in candidates:
+        if lib_signature in (node.import_tokens or []):
+            logging.debug(f"[_find_library_node_by_signature] matched by import_tokens: {node.token} parent={getattr(node.parent,'token',None)}")
+            return node
+
+        if isinstance(node.parent, Group) and node.parent.token == module_name:
+            logging.debug(f"[_find_library_node_by_signature] matched by parent token: {node.token} parent={node.parent.token}")
+            return node
+
+    # Fallback: if no concrete node matched, look for synthesized library nodes
+    for node in all_nodes:
+        if not (node.is_library and node.token == call.token):
+            continue
+
+        if lib_signature in (node.import_tokens or []):
+            logging.debug(f"[_find_library_node_by_signature] matched synthesized by import_tokens: {node.token} parent={getattr(node.parent,'token',None)}")
+            return node
+
+        if isinstance(node.parent, Group) and node.parent.token == module_name:
+            logging.debug(f"[_find_library_node_by_signature] matched synthesized by parent token: {node.token} parent={node.parent.token}")
+            return node
+
+    logging.debug(f"[_find_library_node_by_signature] no match found for {lib_signature}")
+    return None
+
+
+def _find_library_node_from_variable(call: Call, var: Variable, all_nodes: list[Node]) -> Node:
+    """
+    変数がライブラリインスタンスの場合、その変数経由のメソッド呼び出しに対応するライブラリノードを検索する
+    
+    :param call Call: メソッド呼び出し（例：parser.add_argument()）
+    :param var Variable: 変数（例：parser = argparse.ArgumentParser()）
+    :param all_nodes list[Node]: すべてのノード
+    :rtype: Node|None
+    """
+    if not (call.is_attr() and call.owner_token == var.token):
+        return None
+    
+    if not isinstance(var.points_to, Call):
+        logging.debug(f"[_find_library_node_from_variable] var.points_toはCallではない: {type(var.points_to).__name__}")
+        return None
+    
+    library_call = var.points_to
+    if not (library_call.is_library and library_call.is_attr()):
+        logging.debug(f"[_find_library_node_from_variable] var.points_toはライブラリ呼び出しではない: is_library={library_call.is_library}, is_attr()={library_call.is_attr()}")
+        return None
+    
+    # 元のライブラリ呼び出し（例：argparse.ArgumentParser）からモジュール名を取得
+    lib_module_name = library_call.owner_token.split('.')[0] if '.' in library_call.owner_token else library_call.owner_token
+    logging.debug(f"[_find_library_node_from_variable] ライブラリモジュール名: {lib_module_name}, 検索するメソッド名: {call.token}")
+    
+    # 対応するライブラリノードを検索（メソッド名で検索、例：add_argument）
+    candidates = [n for n in all_nodes if n.token == call.token]
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        logging.debug(f"[_find_library_node_from_variable] lib_module_name={lib_module_name} call.token={call.token} candidates={[(n.token, getattr(n.parent,'token',None), n.import_tokens, n.is_library) for n in candidates]}")
+
+    for node in candidates:
+        if node.is_library and node.token == call.token:
+            if isinstance(node.parent, Group) and node.parent.token == lib_module_name:
+                logging.debug(f"[_find_library_node_from_variable] ライブラリノードが見つかりました: {node.token} parent={node.parent.token}")
+                return node
+    
+    logging.debug(f"[_find_library_node_from_variable] ライブラリノードが見つかりませんでした: token={call.token}, module={lib_module_name}")
+    return None
+
+
+def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     """
     Given a call that happened on a node (node_a), return the node
     that the call links to and the call itself if >1 node matched.
+    ノード (node_a) で発生した呼び出しが指定されると、
+
+    呼び出しがリンクされているノードと、一致するノードが 1 つ以上ある場合は呼び出し自体を返します。
 
     :param call Call:
     :param node_a Node:
@@ -375,45 +574,266 @@ def _find_link_for_call(call, node_a, all_nodes):
     :returns: The node it links to and the call if >1 node matched.
     :rtype: (Node|None, Call|None)
     """
+    logging.debug(f"[_find_link_for_call] 呼び出しチェック開始: node_a.token={node_a.token}, call.to_string()={call.to_string()}, call.owner_token={call.owner_token}, call.token={call.token}, call.is_attr()={call.is_attr()}, call.is_library={call.is_library}")
+
+    # Handle calls made via super(), e.g. `super().method()`.
+    # When we see an attribute call whose owner_token is 'super', resolve
+    # the call to the appropriate method on the first matching parent
+    # class (if heuristics are enabled and inheritance info is available).
+    # NOTE: This resolution only works when the parent class's methods are
+    # represented in `parent_group.inherits` (i.e. the parent class was
+    # parsed/available to the resolver). If the parent class is defined in
+    # an external module that was not parsed (or could not be resolved),
+    # no match will be found and no `via super` link will be created.
+    if _HEURISTICS_ENABLED and call.is_attr() and call.owner_token == 'super':
+        parent_group = getattr(node_a, 'parent', None)
+        candidates = []
+        if parent_group and getattr(parent_group, 'group_type', None) == GROUP_TYPE.CLASS:
+            # Search through inherited node lists (each entry is a list of nodes)
+            for inherit_nodes in getattr(parent_group, 'inherits', []):
+                for candidate in inherit_nodes:
+                    if candidate.token == call.token:
+                        candidates.append(candidate)
+
+            if candidates:
+                if len(candidates) == 1:
+                    # Mark the call so the edge can be labeled later
+                    try:
+                        call.via_super = True
+                    except Exception:
+                        pass
+                    logging.debug(f"[_find_link_for_call] super() によって継承側メソッドをマッチ: {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
+                    return candidates[0], None, None
+                else:
+                    logging.debug(f"[_find_link_for_call] super() によって複数候補: {[c.token for c in candidates]}")
+                    return None, call, (candidates, [])
+    # 0.5. owner == 'self' の場合、まず同クラス内のメソッドを探し、なければ継承チェーンを探す
+    # 実行はヒューリスティックが有効な場合のみ行う（CLIオプションで制御）。
+    if _HEURISTICS_ENABLED and call.is_attr() and call.owner_token == 'self':
+        parent_group = getattr(node_a, 'parent', None)
+        candidates = []
+        if parent_group and getattr(parent_group, 'group_type', None) == GROUP_TYPE.CLASS:
+            # 1) 同クラス内のメソッドを優先
+            for node in getattr(parent_group, 'nodes', []):
+                if node.token == call.token:
+                    candidates.append(node)
+
+            if candidates:
+                # 同クラス内に見つかったら、それを返す（通常は一意）
+                if len(candidates) == 1:
+                    logging.debug(f"[_find_link_for_call] 同クラスによってマッチ: {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
+                    return candidates[0], None, None
+                else:
+                    logging.debug(f"[_find_link_for_call] 同クラス内で複数候補: {[c.token for c in candidates]}")
+                    return None, call, (candidates, [])
+
+            # 2) 継承チェーン内を検索
+            for inherit_nodes in getattr(parent_group, 'inherits', []):
+                for candidate in inherit_nodes:
+                    if candidate.token == call.token:
+                        candidates.append(candidate)
+
+            # 3) ネストされたクラス（subgroup）を探して、そのコンストラクタを返す
+            for subgroup in getattr(parent_group, 'subgroups', []):
+                if subgroup.token == call.token:
+                    ctor = subgroup.get_constructor()
+                    if ctor:
+                        logging.debug(f"[_find_link_for_call] ネストクラスのコンストラクタによってマッチ: {ctor.token} parent={getattr(ctor.parent,'token',None)}")
+                        return ctor, None, None
+                    else:
+                        # Synthesize a constructor node for the nested class so
+                        # calls like `self.Inner()` can point to `Inner.__init__()`.
+                        synth_ctor = Node(token='__init__', calls=[], variables=None,
+                                         parent=subgroup, import_tokens=[],
+                                         line_number=None, is_constructor=True,
+                                         is_library=False, missing=False,
+                                         implicit_constructor=True)
+                        subgroup.add_node(synth_ctor)
+                        # Add to the global node list so subsequent resolution can find it
+                        try:
+                            all_nodes.append(synth_ctor)
+                        except Exception:
+                            pass
+                        logging.debug(f"[_find_link_for_call] 合成コンストラクタを作成: {synth_ctor.token} parent={subgroup.token}")
+                        return synth_ctor, None, None
+
+        if candidates:
+            if len(candidates) == 1:
+                logging.debug(f"[_find_link_for_call] 継承によってマッチ: {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
+                return candidates[0], None, None
+            else:
+                logging.debug(f"[_find_link_for_call] 継承候補が複数見つかりました: {[c.token for c in candidates]}")
+                return None, call, (candidates, [])
+
+    # 1. 直接のライブラリ呼び出しをチェック（例：argparse.ArgumentParser()）
+    lib_node = _find_library_node_by_signature(call, all_nodes)
+    if lib_node:
+        return lib_node, None, None
+
+    # Heuristic: sometimes the attribute call shows up with an unknown owner
+    # (e.g. `UNKNOWN_VAR.fromutc()`) while a separate `super()` call exists
+    # in the same function body. If so, and the parent class inherits a
+    # matching method, treat this attribute call as coming from `super()`.
+    # NOTE: This heuristic relies on the resolver having access to the
+    # parent class's inherited methods (via `parent_group.inherits`). If
+    # the parent class is external/unparsed, this heuristic cannot match
+    # the inherited method and will not produce a `via super` link.
+    if _HEURISTICS_ENABLED and call.is_attr() and (call.owner_token == OWNER_CONST.UNKNOWN_VAR or not call.owner_token):
+        parent_group = getattr(node_a, 'parent', None)
+        if parent_group and getattr(parent_group, 'group_type', None) == GROUP_TYPE.CLASS:
+            candidates = []
+            for inherit_nodes in getattr(parent_group, 'inherits', []):
+                for candidate in inherit_nodes:
+                    if candidate.token == call.token:
+                        candidates.append(candidate)
+            if candidates:
+                # Check whether a `super` call exists in this node's calls
+                has_super = any((getattr(c, 'token', None) == 'super') or (getattr(c, 'owner_token', None) == 'super') for c in (node_a.calls or []))
+                if has_super:
+                    if len(candidates) == 1:
+                        try:
+                            call.via_super = True
+                        except Exception:
+                            pass
+                        logging.debug(f"[_find_link_for_call] heuristic: UNKNOWN owner resolved via super to {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
+                        return candidates[0], None, None
+                    else:
+                        return None, call, (candidates, [])
 
     all_vars = node_a.get_variables(call.line_number)
 
+    # 2. ライブラリインスタンス経由の呼び出しをチェック（例：parser.add_argument()）
+    if call.is_attr() and call.owner_token:
+        logging.debug(f"[_find_link_for_call] ライブラリインスタンス経由の呼び出しチェック: call.owner_token={call.owner_token}, call.token={call.token}")
+        for var in all_vars:
+            if call.owner_token == var.token:
+                logging.debug(f"[_find_link_for_call] 変数マッチ: var.token={var.token}, var.points_to型={type(var.points_to).__name__}")
+                lib_node = _find_library_node_from_variable(call, var, all_nodes)
+                if lib_node:
+                    return lib_node, None, None
+
+    # 3. 変数マッチングによる解決
     for var in all_vars:
         var_match = call.matches_variable(var)
-        if var_match:
-            # Unknown modules (e.g. third party) we don't want to match)
-            if var_match == OWNER_CONST.UNKNOWN_MODULE:
-                return None, None
-            assert isinstance(var_match, Node)
-            return var_match, None
+        if not var_match:
+            continue
+        
+        # 未知のモジュールはマッチしないようにする
+        if var_match == OWNER_CONST.UNKNOWN_MODULE:
+            return None, None, None
+        
+        # ライブラリ呼び出しで変数がマッチした場合でも、ライブラリノードが存在すればそれを優先する
+        lib_node = _find_library_node_by_signature(call, all_nodes)
+        if lib_node:
+            return lib_node, None, None
+        
+        return var_match, None, None
 
+    # If this call was produced by calling a factory (e.g. `factory()(5)`),
+    # try to resolve the factory function's return tokens (or lambda) and
+    # map the outer call to the returned function/lambda.
+    try:
+        factory_name = getattr(call, 'factory_call', None)
+    except Exception:
+        factory_name = None
+    if factory_name:
+        # Find the factory node in all_nodes
+        factory_nodes = [n for n in all_nodes if n.token == factory_name]
+        if factory_nodes:
+            # Prefer file-level function node
+            factory_node = next((n for n in factory_nodes if isinstance(n.parent, Group) and n.parent.group_type == GROUP_TYPE.FILE), factory_nodes[0])
+            # If the factory returns a named function, try to resolve that
+            ret_tokens = getattr(factory_node, 'return_tokens', []) or []
+            for rt in ret_tokens:
+                target = next((n for n in all_nodes if n.token == rt), None)
+                if target:
+                    try:
+                        call.via_factory = True
+                    except Exception:
+                        pass
+                    return target, None, None
+            # If factory returns a lambda, synthesize a lambda node under factory's parent
+            if getattr(factory_node, 'returns_lambda', False):
+                synth_token = f"{factory_node.token}::<lambda>"
+                synth_ctor = Node(token=synth_token, calls=[], variables=None,
+                                 parent=factory_node.parent, import_tokens=[],
+                                 line_number=None, is_constructor=False,
+                                 is_library=False, missing=False)
+                try:
+                    factory_node.parent.add_node(synth_ctor)
+                except Exception:
+                    pass
+                try:
+                    all_nodes.append(synth_ctor)
+                except Exception:
+                    pass
+                try:
+                    call.via_factory = True
+                except Exception:
+                    pass
+                return synth_ctor, None, None
+
+    # 4. 直接的なノードマッチング
     possible_nodes = []
+    impossible_nodes = []
+
     if call.is_attr():
+        node_a_file_group = node_a.file_group()
         for node in all_nodes:
-            # checking node.parent != node_a.file_group() prevents self linkage in cases like
-            # function a() {b = Obj(); b.a()}
-            if call.token == node.token and node.parent != node_a.file_group():
+            if call.token == node.token and node.parent != node_a_file_group:
                 possible_nodes.append(node)
+            else:
+                impossible_nodes.append((node, 1))
     else:
         for node in all_nodes:
-            if call.token == node.token \
-               and isinstance(node.parent, Group)  \
-               and node.parent.group_type == GROUP_TYPE.FILE:
+            if call.token == node.token and isinstance(node.parent, Group) and node.parent.group_type == GROUP_TYPE.FILE:
                 possible_nodes.append(node)
             elif call.token == node.parent.token and node.is_constructor:
                 possible_nodes.append(node)
+            else:
+                impossible_nodes.append((node, 2))
+
+    # If we didn't find an explicit target node but a class group with the
+    # same name exists, treat ClassName() as calling its constructor. If the
+    # constructor is not defined, synthesize an implicit constructor node and
+    # mark it as an implicit constructor so the graph shows that fact.
+    if not possible_nodes:
+        for node in all_nodes:
+            parent = getattr(node, 'parent', None)
+            try:
+                is_class_grp = isinstance(parent, Group) and parent.group_type == GROUP_TYPE.CLASS
+            except Exception:
+                is_class_grp = False
+            if is_class_grp and parent.token == call.token:
+                ctor = parent.get_constructor()
+                if ctor:
+                    logging.debug(f"[_find_link_for_call] Matched class constructor: {ctor.token} parent={getattr(ctor.parent,'token',None)}")
+                    return ctor, None, None
+                # Synthesize implicit constructor for this class
+                synth_ctor = Node(token='__init__', calls=[], variables=None,
+                                 parent=parent, import_tokens=[], line_number=None,
+                                 is_constructor=True, is_library=False, missing=False,
+                                 implicit_constructor=True)
+                parent.add_node(synth_ctor)
+                try:
+                    all_nodes.append(synth_ctor)
+                except Exception:
+                    pass
+                logging.debug(f"[_find_link_for_call] Synthesized implicit constructor: {synth_ctor.token} parent={parent.token}")
+                return synth_ctor, None, None
 
     if len(possible_nodes) == 1:
-        return possible_nodes[0], None
+        return possible_nodes[0], None, None
     if len(possible_nodes) > 1:
-        return None, call
-    return None, None
+        return None, call, (possible_nodes, impossible_nodes)
+    return None, None, None
 
 
-def _find_links(node_a, all_nodes):
+def _find_links(node_a: Node, all_nodes):
     """
     Iterate through the calls on node_a to find everything the node links to.
-    This will return a list of tuples of nodes and calls that were ambiguous.
+    This will return a list of tuples of nodes and calls that were ambiguous.\n
+    node_aからのリンク先を抽出する。
 
     :param Node node_a:
     :param list[Node] all_nodes:
@@ -422,8 +842,19 @@ def _find_links(node_a, all_nodes):
     """
 
     links = []
+
+    if node_a.calls is None:
+        pass
+
     for call in node_a.calls:
-        lfc = _find_link_for_call(call, node_a, all_nodes)
+        # node_aがライブラリの場合はここでNoneType is not iterableで怒られる。
+        # 関数は呼び先がない場合もcallsには空のリストが割り当たっているのでNode生成時にライブラリもそうすべき。
+        if call.owner_token is not None:
+            pass
+
+        _possible_node, _call, _nodes = _find_link_for_call(call, node_a, all_nodes)
+        # Return triple: (resolved_node_or_None, bad_call_or_None, original_call)
+        lfc = (_possible_node, _call, call)
         assert not isinstance(lfc, Group)
         links.append(lfc)
     return list(filter(None, links))
@@ -431,8 +862,8 @@ def _find_links(node_a, all_nodes):
 
 def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_functions,
            include_only_namespaces, include_only_functions,
-           skip_parse_errors, lang_params):
-    '''
+           skip_parse_errors, lang_params, alias_labels=False, heuristics=True):
+    """
     Given a language implementation and a list of filenames, do these things:
     1. Read/parse source ASTs
     2. Find all groups (classes/modules) and nodes (functions) (a lot happens here)
@@ -454,7 +885,9 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     :param LanguageParams lang_params:
 
     :rtype: (list[Group], list[Node], list[Edge])
-    '''
+    """
+
+    # ToDo: ここの関数でimportモジュールをnodeに詰めて、呼び出し関係をedgeに詰めれば勝ち
 
     language = LANGUAGES[extension]
 
@@ -462,7 +895,7 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     language.assert_dependencies()
 
     # 1. Read/parse source ASTs
-    file_ast_trees = []
+    file_ast_trees: list[(str, ast.AST)] = []
     for source in sources:
         try:
             file_ast_trees.append((source, language.get_tree(source, lang_params)))
@@ -472,11 +905,32 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
             else:
                 raise ex
 
-    # 2. Find all groups (classes/modules) and nodes (functions) (a lot happens here)
+    # 2. Find all groups (classes/modules), nodes (functions) (a lot happens here) and external-modules
+    # Use recursive parsing to include local imported modules so that
+    # imports like `from exclude_modules_b import match` get their definitions
+    # included in the file_groups for resolution later.
     file_groups = []
-    for source, file_ast_tree in file_ast_trees:
-        file_group = make_file_group(file_ast_tree, source, extension)
-        file_groups.append(file_group)
+    parsed_files = set()
+    # Heuristics toggle: when enabled, recursively follow local imports. When
+    # disabled, only parse the explicit source files provided on the CLI.
+    global _HEURISTICS_ENABLED
+    _HEURISTICS_ENABLED = bool(heuristics)
+
+    for source, _file_ast_tree in file_ast_trees:
+        base_dir = os.path.dirname(source) or '.'
+        try:
+            if _HEURISTICS_ENABLED:
+                groups = parse_file_recursive(source, base_dir, parsed_files, extension)
+                for g in groups:
+                    file_groups.append(g)
+            else:
+                # Only parse the explicit file; do not follow imports.
+                file_groups.append(make_file_group(_file_ast_tree, source, extension))
+        except Exception as ex:
+            if skip_parse_errors:
+                logging.warning("Could not parse dependency tree for %r (%r). Skipping...", source, ex)
+            else:
+                raise
 
     # 3. Trim namespaces / functions to exactly what we want
     if exclude_namespaces or include_only_namespaces:
@@ -485,47 +939,356 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
         file_groups = _limit_functions(file_groups, exclude_functions, include_only_functions)
 
     # 4. Consolidate structures
-    all_subgroups = flatten(g.all_groups() for g in file_groups)
-    all_nodes = flatten(g.all_nodes() for g in file_groups)
+    # file_groupsに階層化してあるnodesとsubgroupsをここで同一階層に展開する。
+    unflatten_g_groups = [g.all_groups() for g in file_groups]
+    all_subgroups = flatten(unflatten_g_groups)
+
+    unflatten_g_nodes = [g.all_nodes() for g in file_groups]
+    all_nodes = flatten(unflatten_g_nodes)
+
+    unflatten_g_imports = [g.all_imports() for g in file_groups]
+    all_imports = flatten(unflatten_g_imports)
 
     nodes_by_subgroup_token = collections.defaultdict(list)
+    # Use hierarchical subgroup keys to avoid token collisions for nested classes.
+    def subgroup_full_token(sg: Group):
+        parts = []
+        cur = sg
+        # Walk up until we reach the file group
+        while cur and getattr(cur, 'group_type', None) != GROUP_TYPE.FILE:
+            parts.insert(0, cur.token)
+            cur = cur.parent
+        if cur and getattr(cur, 'group_type', None) == GROUP_TYPE.FILE:
+            parts.insert(0, cur.token)
+        return djoin(*parts)
+
     for subgroup in all_subgroups:
-        if subgroup.token in nodes_by_subgroup_token:
-            logging.warning("Duplicate group name %r. Naming collision possible.",
-                            subgroup.token)
-        nodes_by_subgroup_token[subgroup.token] += subgroup.nodes
+        full = subgroup_full_token(subgroup)
+        if full in nodes_by_subgroup_token:
+            logging.warning("Duplicate group full token %r. Naming collision possible.", full)
+        nodes_by_subgroup_token[full] += subgroup.nodes
 
     for group in file_groups:
         for subgroup in group.all_groups():
-            subgroup.inherits = [nodes_by_subgroup_token.get(g) for g in subgroup.inherits]
-            subgroup.inherits = list(filter(None, subgroup.inherits))
-            for inherit_nodes in subgroup.inherits:
-                for node in subgroup.nodes:
-                    node.variables += [Variable(n.token, n, n.line_number) for n in inherit_nodes]
+            # Populate inheritance links and inject inherited methods as
+            # variables into subclasses only when heuristics are enabled.
+            if _HEURISTICS_ENABLED:
+                resolved_inherits = []
+                for inh in list(subgroup.inherits):
+                    # inh is a bare name (from AST); match against hierarchical keys.
+                    matched = []
+                    for key, nodes_list in nodes_by_subgroup_token.items():
+                        # key endswith the class name?
+                        if key.split('.')[-1] == inh:
+                            matched.append(nodes_list)
+                    if matched:
+                        # flatten matched lists and append
+                        for ml in matched:
+                            resolved_inherits.append(ml)
+                subgroup.inherits = resolved_inherits
+                for inherit_nodes in subgroup.inherits:
+                    for node in subgroup.nodes:
+                        node.variables += [Variable(n.token, n, n.line_number) for n in inherit_nodes]
+            else:
+                # If heuristics disabled, keep original inherited token names (unresolved)
+                subgroup.inherits = []
 
     # 5. Attempt to resolve the variables (point them to a node or group)
     for node in all_nodes:
-        node.resolve_variables(file_groups)
+        if node.variables is not None:
+            node.resolve_variables(file_groups)
+        # Todo:↑にfile_groupだけではなくlib_groupも追加して解決してやる必要があるのでは？
+        #      file_groupの要素にimportsも入っているので大丈夫のはず。
+        
+
+    # Argument-propagation heuristic: if a call passes a function name as a
+    # positional arg into another function (e.g. `trace(do_something)`), then
+    # propagate that argument into the callee's parameter variable so that
+    # later `fn()` calls inside the callee can resolve to the passed function.
+    if _HEURISTICS_ENABLED:
+        for node in all_nodes:
+            if not node.calls:
+                continue
+            for call in node.calls:
+                arg_tokens = getattr(call, 'arg_tokens', None) or []
+                if not arg_tokens:
+                    continue
+                # Find the target function node for this call (simple file-level match)
+                candidates = [n for n in all_nodes if n.token == call.token and isinstance(n.parent, Group) and n.parent.group_type == GROUP_TYPE.FILE]
+                if len(candidates) != 1:
+                    continue
+                target = candidates[0]
+                param_tokens = getattr(target, 'param_tokens', [])
+                if not param_tokens:
+                    continue
+                # Map positional args -> params by index
+                for i, arg_tok in enumerate(arg_tokens):
+                    if i >= len(param_tokens):
+                        break
+                    param_name = param_tokens[i]
+                    # find a node that matches the argument token
+                    arg_node = next((n for n in all_nodes if n.token == arg_tok), None)
+                    if not arg_node:
+                        continue
+                    # find the variable in the target function for this parameter
+                    if target.variables:
+                        for var in target.variables:
+                            if var.token == param_name:
+                                var.points_to = arg_node
+                                logging.debug(f"[arg-prop] Propagated arg {arg_tok} -> {target.token}.{param_name}")
+                                break
 
     # Not a step. Just log what we know so far
     logging.info("Found groups %r." % [g.label() for g in all_subgroups])
     logging.info("Found nodes %r." % sorted(n.token_with_ownership() for n in all_nodes))
-    logging.info("Found calls %r." % sorted(list(set(c.to_string() for c in
-                                                     flatten(n.calls for n in all_nodes)))))
+    unflatten_n_calls = [n.calls for n in all_nodes]
+    logging.info("Found calls %r." % sorted(list(set(c.to_string() for c in flatten(unflatten_n_calls)))))
     logging.info("Found variables %r." % sorted(list(set(v.to_string() for v in
                                                          flatten(n.variables for n in all_nodes)))))
+
+    # 5.5. ライブラリ呼び出しからライブラリ関数のノードを作成する
+    # すべてのライブラリ呼び出しを収集し、それらのノードを作成する
+    library_nodes_by_signature = {}
+    library_groups_by_module = {}
+    # Builtin names (e.g. print, len) should be treated as library functions
+    # Use a callable filter so we only consider callable builtins (functions/types)
+    # and exclude non-callable names (constants, dunder names that aren't callables, etc.).
+    try:
+        builtin_names = {name for name, val in builtins.__dict__.items() if callable(val)}
+    except Exception:
+        # Fallback to the original approach if something unexpected happens
+        builtin_names = set(dir(builtins))
+    
+    unflatten_n_calls_all = [n.calls for n in all_nodes if n.calls]
+    all_calls = flatten(unflatten_n_calls_all)
+    
+    for call in all_calls:
+        if call.is_library and call.is_attr() and call.owner_token:
+            # ライブラリ関数のシグネチャを作成（例："requests.get"）
+            lib_signature = djoin(call.owner_token, call.token)
+            
+            if lib_signature not in library_nodes_by_signature:
+                # モジュール名を抽出（owner_tokenの最初の部分）
+                module_name = call.owner_token.split('.')[0] if '.' in call.owner_token else call.owner_token
+                
+                # ライブラリモジュールのグループを作成または取得
+                if module_name not in library_groups_by_module:
+                    # Use a special display type for Python builtins so they
+                    # are shown under a "Built-in Functions" cluster instead
+                    # of the generic Library cluster.
+                    display_type = "Built-in Functions" if module_name == 'builtins' else "Library"
+                    lib_group = Group(
+                        token=module_name,
+                        group_type=GROUP_TYPE.NAMESPACE,
+                        display_type=display_type,
+                        import_tokens=[module_name],
+                        line_number=0,
+                        parent=None
+                    )
+                    library_groups_by_module[module_name] = lib_group
+                
+                lib_group = library_groups_by_module[module_name]
+                
+                # ライブラリ関数のノードを作成
+                lib_node = Node(
+                    token=call.token,
+                    calls=[],
+                    variables=None,
+                    parent=lib_group,
+                    import_tokens=[lib_signature],
+                    line_number=call.line_number,
+                    is_constructor=False,
+                    is_library=True
+                )
+                
+                lib_group.add_node(lib_node)
+                library_nodes_by_signature[lib_signature] = lib_node
+    
+    # ライブラリグループを file_groups に追加し、ライブラリノードを all_nodes に追加する
+    # Special-case: place the 'builtins' module in its own top-level file group
+    builtins_file_group = None
+    for lib_group in library_groups_by_module.values():
+        if lib_group.token == 'builtins':
+            # Create or reuse a top-level file_group for builtins so it doesn't
+            # appear as a subgroup of the analyzed source file (e.g. __init__.py).
+            if builtins_file_group is None:
+                builtins_file_group = Group(token='builtins', group_type=GROUP_TYPE.FILE,
+                                            display_type='File', import_tokens=[], line_number=0, parent=None)
+                file_groups.append(builtins_file_group)
+            builtins_file_group.add_subgroup(lib_group)
+            lib_group.parent = builtins_file_group
+        else:
+            # Attach other library groups as pseudo-subgroups of the first file_group
+            if file_groups:
+                file_groups[0].add_subgroup(lib_group)
+                lib_group.parent = file_groups[0]
+        all_nodes.extend(lib_group.all_nodes())
 
     # 6. Find all calls between all nodes
     bad_calls = []
     edges = []
+    # Collect synthesized nodes for unresolved calls and place them in a special group
+    missing_nodes_by_key = {}
+    missing_group = Group(token='NotFound', group_type=GROUP_TYPE.FILE, display_type='File', import_tokens=[], line_number=0, parent=None)
     for node_a in list(all_nodes):
-        links = _find_links(node_a, all_nodes)
-        for node_b, bad_call in links:
+        # ToDo: ここのall_nodesに外部モジュールの関数を呼び出している部分が入っていないので入れる。
+        links = _find_links(node_a, all_nodes + all_imports)
+        for node_b, bad_call, call in links:
             if bad_call:
                 bad_calls.append(bad_call)
             if not node_b:
-                continue
-            edges.append(Edge(node_a, node_b))
+                # If the unresolved call is a builtin function (like `print()`),
+                # synthesize or reuse a library node under the `builtins` module
+                # instead of creating a generic NotFound node.
+                try:
+                    is_builtin = (call.owner_token is None) and (call.token in builtin_names)
+                except Exception:
+                    is_builtin = False
+
+                if is_builtin:
+                    module_name = 'builtins'
+                    lib_sig = djoin(module_name, call.token)
+                    # Ensure a builtin library group exists
+                    if module_name not in library_groups_by_module:
+                        display_type = "Built-in Functions" if module_name == 'builtins' else "Library"
+                        lib_group = Group(
+                            token=module_name,
+                            group_type=GROUP_TYPE.NAMESPACE,
+                            display_type=display_type,
+                            import_tokens=[module_name],
+                            line_number=0,
+                            parent=None
+                        )
+                        library_groups_by_module[module_name] = lib_group
+                    lib_group = library_groups_by_module[module_name]
+
+                    # Reuse existing synthesized builtin node if present
+                    if lib_sig in library_nodes_by_signature:
+                        node_b = library_nodes_by_signature[lib_sig]
+                    else:
+                        lib_node = Node(
+                            token=call.token,
+                            calls=[],
+                            variables=None,
+                            parent=lib_group,
+                            import_tokens=[lib_sig],
+                            line_number=call.line_number,
+                            is_constructor=False,
+                            is_library=True
+                        )
+                        lib_group.add_node(lib_node)
+                        library_nodes_by_signature[lib_sig] = lib_node
+                        all_nodes.append(lib_node)
+                        node_b = lib_node
+
+                    # Ensure the builtin library group is attached to a file_group for output
+                    if file_groups and lib_group.parent is None:
+                        # Prefer attaching builtins to their own top-level file group
+                        if lib_group.token == 'builtins':
+                            # Find existing builtins file group or create one
+                            existing = next((g for g in file_groups if g.token == 'builtins' and g.group_type == GROUP_TYPE.FILE), None)
+                            if existing is None:
+                                existing = Group(token='builtins', group_type=GROUP_TYPE.FILE, display_type='File', import_tokens=[], line_number=0, parent=None)
+                                file_groups.append(existing)
+                            existing.add_subgroup(lib_group)
+                            lib_group.parent = existing
+                        else:
+                            file_groups[0].add_subgroup(lib_group)
+                            lib_group.parent = file_groups[0]
+                    # proceed to create edge to node_b (builtin)
+                    
+                else:
+                    # Unresolved call: synthesize a NotFound node and link to it
+                    try:
+                        key = call.to_string()
+                    except Exception:
+                        # Fallback key
+                        key = (call.owner_token + '.' + call.token) if call.owner_token else call.token
+
+                    if key not in missing_nodes_by_key:
+                        missing_node = Node(token=call.token, calls=[], variables=None, parent=missing_group,
+                                            import_tokens=[], line_number=None, is_constructor=False,
+                                            is_library=False, missing=True)
+                        missing_group.add_node(missing_node)
+                        all_nodes.append(missing_node)
+                        missing_nodes_by_key[key] = missing_node
+
+                    node_b = missing_nodes_by_key[key]
+
+            edge = Edge(node_a, node_b)
+            # If this call was resolved via `super()`, annotate the edge.
+            # This initial assignment may be overwritten by alias labeling; we
+            # append '(via super)' afterwards to preserve the information.
+            try:
+                if getattr(call, 'via_super', False):
+                    edge.label = 'via super'
+            except Exception:
+                pass
+            if alias_labels:
+                try:
+                    if call:
+                        vars_at_line = node_a.get_variables(call.line_number)
+                        # 1) Non-attribute calls: same as before
+                        if not call.is_attr():
+                            for var in vars_at_line:
+                                if var.token == call.token:
+                                    # If the variable points to the node we're linking to,
+                                    # annotate the edge with the alias used.
+                                    if var.points_to == node_b or (isinstance(var.points_to, Group) and node_b in var.points_to.all_nodes()):
+                                        edge.label = f"as {call.token}()"
+                                        break
+                        else:
+                            # 2) Attribute calls like `obj.method()` — find variable matching owner_token
+                            owner = call.owner_token
+                            for var in vars_at_line:
+                                try:
+                                    if var.token != owner:
+                                        continue
+                                except Exception:
+                                    continue
+                                # If variable points to the node/group we're linking to,
+                                # label the edge with the alias used: `as obj.method()`
+                                if var.points_to == node_b or (isinstance(var.points_to, Group) and node_b in var.points_to.all_nodes()):
+                                    edge.label = f"as {var.token}.{call.token}()"
+                                    break
+                except Exception:
+                    # Be conservative: ignore labeling errors and emit unlabeled edge
+                    pass
+            # Ensure 'via super' is preserved/appended even when alias labels are used
+            try:
+                if getattr(call, 'via_super', False):
+                    if edge.label:
+                        edge.label = f"{edge.label} (via super)"
+                    else:
+                        edge.label = 'via super'
+            except Exception:
+                pass
+            # Preserve/append factory and dict indirect labels too
+            try:
+                if getattr(call, 'via_factory', False):
+                    if edge.label:
+                        edge.label = f"{edge.label} (via factory)"
+                    else:
+                        edge.label = 'via factory'
+            except Exception:
+                pass
+            try:
+                indirect = getattr(call, 'indirect', None)
+                if indirect and indirect[0] == 'dict':
+                    # indirect == ('dict', var_name, key)
+                    _, var_name, key = indirect
+                    label = f"as {var_name}['{key}']()"
+                    if edge.label:
+                        edge.label = f"{edge.label} {label}"
+                    else:
+                        edge.label = label
+            except Exception:
+                pass
+            edges.append(edge)
+
+    # If we created any missing nodes, ensure their group is included for output
+    if missing_group.nodes:
+        file_groups.append(missing_group)
 
     # 7. Loudly complain about duplicate edges that were skipped
     bad_calls_strings = set()
@@ -672,7 +1435,8 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
               exclude_namespaces=None, exclude_functions=None,
               include_only_namespaces=None, include_only_functions=None,
               no_grouping=False, no_trimming=False, skip_parse_errors=False,
-              lang_params=None, subset_params=None, level=logging.INFO):
+              lang_params=None, subset_params=None, alias_labels=False, level=logging.INFO,
+              heuristics=True):
     """
     Top-level function. Generate a diagram based on source code.
     Can generate either a dotfile or an image.
@@ -711,16 +1475,27 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
     logging.basicConfig(format="Code2Flow: %(message)s", level=level)
 
     sources, language = get_sources_and_language(raw_source_paths, language)
+    # ここでソースのリストを取得、言語を推定
+    # ToDo: sourcesにpipでインストールしたパッケージが含まれていない。まぁそりゃそうか？
+    #  でもどの関数がどのパッケージ呼んでるかとか知りたいんだけどなぁ。
+    #  AST木内のast.Importにimportしたパッケージの名前は入ってるからたどれるはず。
 
     output_ext = None
     if isinstance(output_file, str):
+        # output_fileがstr型の場合にTrue
+        # https://docs.python.org/ja/3/library/functions.html#isinstance
         assert '.' in output_file, "Output filename must end in one of: %r." % set(VALID_EXTENSIONS)
+
         output_ext = output_file.rsplit('.', 1)[1] or ''
+        # output_fileの拡張子を取り出す。
+        # 最大分割回数1回でindex=1を指定するとaaa.bbb.cccのcccが取り出せる。
         assert output_ext in VALID_EXTENSIONS, "Output filename must end in one of: %r." % \
                                                set(VALID_EXTENSIONS)
 
     final_img_filename = None
+    extension = None
     if output_ext and output_ext in IMAGE_EXTENSIONS:
+        # ToDo: １個目のoutput_extいるんだっけ？ 例外出る？
         if not is_installed('dot') and not is_installed('dot.exe'):
             raise AssertionError(
                 "Can't generate a flowchart image because neither `dot` nor "
@@ -734,7 +1509,8 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
     file_groups, all_nodes, edges = map_it(sources, language, no_trimming,
                                            exclude_namespaces, exclude_functions,
                                            include_only_namespaces, include_only_functions,
-                                           skip_parse_errors, lang_params)
+                                           skip_parse_errors, lang_params,
+                                           alias_labels=alias_labels, heuristics=heuristics)
 
     if subset_params:
         logging.info("Filtering into subset...")
@@ -781,7 +1557,7 @@ def main(sys_argv=None):
         'sources', metavar='sources', nargs='+',
         help='source code file/directory paths.')
     parser.add_argument(
-        '--output', '-o', default='out.png',
+        '--output', '-o', default='out.svg',
         help=f'output file path. Supported types are {VALID_EXTENSIONS}.')
     parser.add_argument(
         '--language', choices=['py', 'js', 'rb', 'php'],
@@ -793,7 +1569,8 @@ def main(sys_argv=None):
              'Valid formats include `func`, `class.func`, and `file::class.func`. '
              'Requires --upstream-depth and/or --downstream-depth. ')
     parser.add_argument(
-        '--upstream-depth', type=int, default=0,
+        '--upst'
+        'ream-depth', type=int, default=0,
         help='include n nodes upstream of --target-function.')
     parser.add_argument(
         '--downstream-depth', type=int, default=0,
@@ -836,9 +1613,44 @@ def main(sys_argv=None):
         '--verbose', '-v', action='store_true',
         help='add more logging')
     parser.add_argument(
+        '--alias-labels', action='store_true',
+        help='エッジに変数エイリアス経由の呼び出しをラベル表示します (例: as abra3()).')
+    parser.add_argument(
+        '--heuristics', dest='heuristics', action='store_true',
+        help='Enable resolution heuristics (recursive local imports, inheritance-aware self resolution).')
+    parser.add_argument(
+        '--no-heuristics', dest='heuristics', action='store_false',
+        help='Disable resolution heuristics; only parse explicit files and do not apply inheritance heuristics.')
+    parser.set_defaults(heuristics=True)
+    parser.add_argument(
         '--version', action='version', version='%(prog)s ' + VERSION)
 
     sys_argv = sys_argv or sys.argv[1:]
+
+    # Support simple key=value overrides on the command line, e.g.
+    #   python -m code2flow <sources> level=DEBUG
+    # This extracts known overrides and removes them from argv before
+    # handing the rest to argparse.
+    explicit_level = None
+    filtered_argv = []
+    for item in sys_argv:
+        if isinstance(item, str) and item.startswith('level='):
+            val = item.split('=', 1)[1]
+            # allow either 'DEBUG' or 'logging.DEBUG'
+            if val.startswith('logging.'):
+                val = val.split('.', 1)[1]
+            # numeric level accepted
+            try:
+                explicit_level = int(val)
+            except Exception:
+                lvl = val.upper()
+                explicit_level = getattr(logging, lvl, None)
+                if explicit_level is None:
+                    logging.warning("Unknown logging level %r passed via CLI; ignoring.", val)
+            continue
+        filtered_argv.append(item)
+
+    sys_argv = filtered_argv
     args = parser.parse_args(sys_argv)
     level = logging.INFO
     if args.verbose and args.quiet:
@@ -857,6 +1669,13 @@ def main(sys_argv=None):
     subset_params = SubsetParams.generate(args.target_function, args.upstream_depth,
                                           args.downstream_depth)
 
+    alias_labels = bool(getattr(args, 'alias_labels', False))
+
+    # If the user passed an explicit level via key=value on the command line,
+    # prefer that over --verbose/--quiet computed value.
+    if explicit_level is not None:
+        level = explicit_level
+
     code2flow(
         raw_source_paths=args.sources,
         output_file=args.output,
@@ -871,5 +1690,7 @@ def main(sys_argv=None):
         skip_parse_errors=args.skip_parse_errors,
         lang_params=lang_params,
         subset_params=subset_params,
+        alias_labels=alias_labels,
         level=level,
+        heuristics=args.heuristics,
     )
