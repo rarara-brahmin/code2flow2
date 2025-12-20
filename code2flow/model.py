@@ -464,6 +464,10 @@ class Node():
                     for group in file_group.all_groups():
                         if group.token == call.token:
                             variable.points_to = group
+            elif isinstance(variable.points_to, dict):
+                # dict literal mappings are left as-is for subscript-call resolution
+                # (handled by Python.get_call_from_func_element using scope_stack)
+                continue
             else:
                 assert isinstance(variable.points_to, (Node, Group))
 

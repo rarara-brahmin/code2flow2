@@ -77,6 +77,52 @@ def get_call_from_func_element(func, scope_stack=None, call_node=None):
         return Call(token=func.attr, line_number=func.lineno, owner_token=owner_token, is_library=is_library, arg_tokens=arg_tokens)
     if type(func) == ast.Name:
         return Call(token=func.id, line_number=func.lineno, arg_tokens=arg_tokens)
+    # Handle subscript calls like `func_dict['name']()` by resolving the
+    # subscript against scope_stack mappings created by `process_assign`.
+    if type(func) == ast.Subscript:
+        # Only handle simple cases: Name[...] where slice is a constant string
+        val = getattr(func, 'value', None)
+        slc = getattr(func, 'slice', None)
+        key = None
+        if isinstance(slc, ast.Constant):
+            key = slc.value
+        else:
+            # Python <3.9 used ast.Index
+            try:
+                if isinstance(slc, ast.Index) and isinstance(slc.value, ast.Constant):
+                    key = slc.value.value
+            except Exception:
+                key = None
+        if isinstance(val, ast.Name) and isinstance(key, str) and scope_stack is not None:
+            name = val.id
+            # Look up mapping in scope stack
+            for scope in reversed(scope_stack):
+                if name in scope:
+                    mapping = scope[name]
+                    # mapping expected to be a dict of str->str created in process_assign
+                    if isinstance(mapping, dict) and key in mapping:
+                        target_name = mapping[key]
+                        c = Call(token=target_name, line_number=func.lineno, arg_tokens=arg_tokens)
+                        # annotate for labeling later
+                        try:
+                            c.indirect = ('dict', name, key)
+                        except Exception:
+                            pass
+                        return c
+        return None
+    # Handle nested calls like `factory()(5)` where func is itself a Call.
+    if type(func) == ast.Call:
+        # Get the inner call (the function producing a callable)
+        inner = get_call_from_func_element(func.func, scope_stack, call_node=func.func)
+        if inner:
+            # Produce a Call that keeps reference to the inner call so
+            # resolution can inspect the producer's return info later.
+            c = Call(token=inner.token, line_number=func.lineno, arg_tokens=arg_tokens)
+            try:
+                c.factory_call = inner.token
+            except Exception:
+                pass
+            return c
     if type(func) in (ast.Subscript, ast.Call):
         return None
 
@@ -111,26 +157,46 @@ def process_assign(element, scope_stack=None):
     :rtype: Variable
     """
 
-    if type(element.value) != ast.Call:
-        return []
-    call = get_call_from_func_element(element.value.func, scope_stack)
-    if not call:
-        return []
+    # Handle calls: obj = SomeClass() or obj = factory()
+    if type(element.value) == ast.Call:
+        call = get_call_from_func_element(element.value.func, scope_stack)
+        if not call:
+            return []
+        ret = []
+        # 型推論: 右辺がクラスインスタンス化なら型情報を記録
+        class_name = None
+        if isinstance(element.value.func, ast.Name):
+            class_name = element.value.func.id
+        for target in element.targets:
+            if type(target) != ast.Name:
+                continue
+            token = target.id
+            ret.append(Variable(token, call, element.lineno))
+            # スコープスタックに型情報を記録
+            if scope_stack is not None and class_name:
+                scope_stack[-1][token] = class_name
+        return ret
 
-    ret = []
-    # 型推論: 右辺がクラスインスタンス化なら型情報を記録
-    class_name = None
-    if isinstance(element.value.func, ast.Name):
-        class_name = element.value.func.id
-    for target in element.targets:
-        if type(target) != ast.Name:
-            continue
-        token = target.id
-        ret.append(Variable(token, call, element.lineno))
-        # スコープスタックに型情報を記録
-        if scope_stack is not None and class_name:
-            scope_stack[-1][token] = class_name
-    return ret
+    # Handle dict literal assignments like func_dict = {'func_a': func_a, ...}
+    if type(element.value) == ast.Dict and scope_stack is not None:
+        mapping = {}
+        keys = getattr(element.value, 'keys', [])
+        values = getattr(element.value, 'values', [])
+        for k, v in zip(keys, values):
+            if isinstance(k, ast.Constant) and isinstance(k.value, str) and isinstance(v, ast.Name):
+                mapping[k.value] = v.id
+        ret = []
+        for target in element.targets:
+            if type(target) != ast.Name:
+                continue
+            token = target.id
+            # Record mapping in current scope so get_call_from_func_element can use it
+            scope_stack[-1][token] = mapping
+            # Also create a Variable that points to this mapping for debugging
+            ret.append(Variable(token, mapping, element.lineno))
+        return ret
+
+    return []
 
 
 def process_import(element, scope_stack=None):
@@ -308,7 +374,19 @@ class Python(BaseLanguage):
             import_tokens = [djoin(parent.token, token)]
 
         node = Node(token, calls, variables, parent, import_tokens=import_tokens,
-                line_number=line_number, is_constructor=is_constructor)
+                    line_number=line_number, is_constructor=is_constructor)
+        # Record simple return info for factory detection: names returned
+        return_tokens = []
+        returns_lambda = False
+        for el in ast.walk(tree):
+            if isinstance(el, ast.Return):
+                val = getattr(el, 'value', None)
+                if isinstance(val, ast.Name):
+                    return_tokens.append(val.id)
+                elif isinstance(val, ast.Lambda):
+                    returns_lambda = True
+        node.return_tokens = return_tokens
+        node.returns_lambda = returns_lambda
         # record parameter ordering for argument-propagation heuristic
         node.param_tokens = param_tokens
         ret = [node]

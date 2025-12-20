@@ -576,6 +576,37 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     """
     logging.debug(f"[_find_link_for_call] 呼び出しチェック開始: node_a.token={node_a.token}, call.to_string()={call.to_string()}, call.owner_token={call.owner_token}, call.token={call.token}, call.is_attr()={call.is_attr()}, call.is_library={call.is_library}")
 
+    # Handle calls made via super(), e.g. `super().method()`.
+    # When we see an attribute call whose owner_token is 'super', resolve
+    # the call to the appropriate method on the first matching parent
+    # class (if heuristics are enabled and inheritance info is available).
+    # NOTE: This resolution only works when the parent class's methods are
+    # represented in `parent_group.inherits` (i.e. the parent class was
+    # parsed/available to the resolver). If the parent class is defined in
+    # an external module that was not parsed (or could not be resolved),
+    # no match will be found and no `via super` link will be created.
+    if _HEURISTICS_ENABLED and call.is_attr() and call.owner_token == 'super':
+        parent_group = getattr(node_a, 'parent', None)
+        candidates = []
+        if parent_group and getattr(parent_group, 'group_type', None) == GROUP_TYPE.CLASS:
+            # Search through inherited node lists (each entry is a list of nodes)
+            for inherit_nodes in getattr(parent_group, 'inherits', []):
+                for candidate in inherit_nodes:
+                    if candidate.token == call.token:
+                        candidates.append(candidate)
+
+            if candidates:
+                if len(candidates) == 1:
+                    # Mark the call so the edge can be labeled later
+                    try:
+                        call.via_super = True
+                    except Exception:
+                        pass
+                    logging.debug(f"[_find_link_for_call] super() によって継承側メソッドをマッチ: {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
+                    return candidates[0], None, None
+                else:
+                    logging.debug(f"[_find_link_for_call] super() によって複数候補: {[c.token for c in candidates]}")
+                    return None, call, (candidates, [])
     # 0.5. owner == 'self' の場合、まず同クラス内のメソッドを探し、なければ継承チェーンを探す
     # 実行はヒューリスティックが有効な場合のみ行う（CLIオプションで制御）。
     if _HEURISTICS_ENABLED and call.is_attr() and call.owner_token == 'self':
@@ -615,7 +646,8 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
                         synth_ctor = Node(token='__init__', calls=[], variables=None,
                                          parent=subgroup, import_tokens=[],
                                          line_number=None, is_constructor=True,
-                                         is_library=False, missing=False)
+                                         is_library=False, missing=False,
+                                         implicit_constructor=True)
                         subgroup.add_node(synth_ctor)
                         # Add to the global node list so subsequent resolution can find it
                         try:
@@ -637,6 +669,36 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     lib_node = _find_library_node_by_signature(call, all_nodes)
     if lib_node:
         return lib_node, None, None
+
+    # Heuristic: sometimes the attribute call shows up with an unknown owner
+    # (e.g. `UNKNOWN_VAR.fromutc()`) while a separate `super()` call exists
+    # in the same function body. If so, and the parent class inherits a
+    # matching method, treat this attribute call as coming from `super()`.
+    # NOTE: This heuristic relies on the resolver having access to the
+    # parent class's inherited methods (via `parent_group.inherits`). If
+    # the parent class is external/unparsed, this heuristic cannot match
+    # the inherited method and will not produce a `via super` link.
+    if _HEURISTICS_ENABLED and call.is_attr() and (call.owner_token == OWNER_CONST.UNKNOWN_VAR or not call.owner_token):
+        parent_group = getattr(node_a, 'parent', None)
+        if parent_group and getattr(parent_group, 'group_type', None) == GROUP_TYPE.CLASS:
+            candidates = []
+            for inherit_nodes in getattr(parent_group, 'inherits', []):
+                for candidate in inherit_nodes:
+                    if candidate.token == call.token:
+                        candidates.append(candidate)
+            if candidates:
+                # Check whether a `super` call exists in this node's calls
+                has_super = any((getattr(c, 'token', None) == 'super') or (getattr(c, 'owner_token', None) == 'super') for c in (node_a.calls or []))
+                if has_super:
+                    if len(candidates) == 1:
+                        try:
+                            call.via_super = True
+                        except Exception:
+                            pass
+                        logging.debug(f"[_find_link_for_call] heuristic: UNKNOWN owner resolved via super to {candidates[0].token} parent={getattr(candidates[0].parent,'token',None)}")
+                        return candidates[0], None, None
+                    else:
+                        return None, call, (candidates, [])
 
     all_vars = node_a.get_variables(call.line_number)
 
@@ -666,6 +728,50 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
             return lib_node, None, None
         
         return var_match, None, None
+
+    # If this call was produced by calling a factory (e.g. `factory()(5)`),
+    # try to resolve the factory function's return tokens (or lambda) and
+    # map the outer call to the returned function/lambda.
+    try:
+        factory_name = getattr(call, 'factory_call', None)
+    except Exception:
+        factory_name = None
+    if factory_name:
+        # Find the factory node in all_nodes
+        factory_nodes = [n for n in all_nodes if n.token == factory_name]
+        if factory_nodes:
+            # Prefer file-level function node
+            factory_node = next((n for n in factory_nodes if isinstance(n.parent, Group) and n.parent.group_type == GROUP_TYPE.FILE), factory_nodes[0])
+            # If the factory returns a named function, try to resolve that
+            ret_tokens = getattr(factory_node, 'return_tokens', []) or []
+            for rt in ret_tokens:
+                target = next((n for n in all_nodes if n.token == rt), None)
+                if target:
+                    try:
+                        call.via_factory = True
+                    except Exception:
+                        pass
+                    return target, None, None
+            # If factory returns a lambda, synthesize a lambda node under factory's parent
+            if getattr(factory_node, 'returns_lambda', False):
+                synth_token = f"{factory_node.token}::<lambda>"
+                synth_ctor = Node(token=synth_token, calls=[], variables=None,
+                                 parent=factory_node.parent, import_tokens=[],
+                                 line_number=None, is_constructor=False,
+                                 is_library=False, missing=False)
+                try:
+                    factory_node.parent.add_node(synth_ctor)
+                except Exception:
+                    pass
+                try:
+                    all_nodes.append(synth_ctor)
+                except Exception:
+                    pass
+                try:
+                    call.via_factory = True
+                except Exception:
+                    pass
+                return synth_ctor, None, None
 
     # 4. 直接的なノードマッチング
     possible_nodes = []
@@ -1110,6 +1216,14 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                     node_b = missing_nodes_by_key[key]
 
             edge = Edge(node_a, node_b)
+            # If this call was resolved via `super()`, annotate the edge.
+            # This initial assignment may be overwritten by alias labeling; we
+            # append '(via super)' afterwards to preserve the information.
+            try:
+                if getattr(call, 'via_super', False):
+                    edge.label = 'via super'
+            except Exception:
+                pass
             if alias_labels:
                 try:
                     if call:
@@ -1140,6 +1254,36 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                 except Exception:
                     # Be conservative: ignore labeling errors and emit unlabeled edge
                     pass
+            # Ensure 'via super' is preserved/appended even when alias labels are used
+            try:
+                if getattr(call, 'via_super', False):
+                    if edge.label:
+                        edge.label = f"{edge.label} (via super)"
+                    else:
+                        edge.label = 'via super'
+            except Exception:
+                pass
+            # Preserve/append factory and dict indirect labels too
+            try:
+                if getattr(call, 'via_factory', False):
+                    if edge.label:
+                        edge.label = f"{edge.label} (via factory)"
+                    else:
+                        edge.label = 'via factory'
+            except Exception:
+                pass
+            try:
+                indirect = getattr(call, 'indirect', None)
+                if indirect and indirect[0] == 'dict':
+                    # indirect == ('dict', var_name, key)
+                    _, var_name, key = indirect
+                    label = f"as {var_name}['{key}']()"
+                    if edge.label:
+                        edge.label = f"{edge.label} {label}"
+                    else:
+                        edge.label = label
+            except Exception:
+                pass
             edges.append(edge)
 
     # If we created any missing nodes, ensure their group is included for output
