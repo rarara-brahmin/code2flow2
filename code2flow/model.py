@@ -308,7 +308,8 @@ class Call():
 
 class Node():
     def __init__(self, token, calls, variables, parent, import_tokens=None,
-                 line_number=None, is_constructor=False, is_library=False, missing=False):
+                 line_number=None, is_constructor=False, is_library=False, missing=False,
+                 implicit_constructor=False):
         self.token = token
         self.line_number = line_number
         self.calls = calls
@@ -318,6 +319,9 @@ class Node():
         self.is_constructor = is_constructor
         self.is_library = is_library
         self.missing = missing
+        # New flag: True if this constructor node was implicitly synthesized
+        # because the class was instantiated but no explicit __init__ exists.
+        self.implicit_constructor = implicit_constructor
 
         self.uid = "node_" + os.urandom(4).hex()
         # ToDo: uidが重複するのを防げない？暗号学的に安全な乱数なので大丈夫かも？
@@ -398,6 +402,14 @@ class Node():
             base = f"{self.line_number}: {self.token}()"
         else:
             base = f"{self.token}()"
+        # If this node represents an implicit constructor synthesized by the
+        # resolver, show a clearer label such as "__init__ (implicit constructor)".
+        if getattr(self, 'implicit_constructor', False):
+            # strip trailing parentheses for readability
+            if base.endswith('()'):
+                base = base[:-2]
+            return f"{base} (implicit constructor)"
+
         if getattr(self, 'missing', False):
             return f"{base} (NotFound)"
         return base

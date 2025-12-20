@@ -1,9 +1,10 @@
 class Outer():
     class Inner():
-        def inner_func():
+        def inner_func(self):
             Outer().outer_func()
 
-    def outer_func(a):
+    @staticmethod
+    def outer_func(self, a):
         print("Outer_func")
         a.inner_func()
 
@@ -13,4 +14,5 @@ class Outer():
 
 
 new_obj = Outer()
-new_obj.outer_func()
+inr_obj = new_obj.Inner()
+new_obj.outer_func(inr_obj)

@@ -687,6 +687,35 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
             else:
                 impossible_nodes.append((node, 2))
 
+    # If we didn't find an explicit target node but a class group with the
+    # same name exists, treat ClassName() as calling its constructor. If the
+    # constructor is not defined, synthesize an implicit constructor node and
+    # mark it as an implicit constructor so the graph shows that fact.
+    if not possible_nodes:
+        for node in all_nodes:
+            parent = getattr(node, 'parent', None)
+            try:
+                is_class_grp = isinstance(parent, Group) and parent.group_type == GROUP_TYPE.CLASS
+            except Exception:
+                is_class_grp = False
+            if is_class_grp and parent.token == call.token:
+                ctor = parent.get_constructor()
+                if ctor:
+                    logging.debug(f"[_find_link_for_call] Matched class constructor: {ctor.token} parent={getattr(ctor.parent,'token',None)}")
+                    return ctor, None, None
+                # Synthesize implicit constructor for this class
+                synth_ctor = Node(token='__init__', calls=[], variables=None,
+                                 parent=parent, import_tokens=[], line_number=None,
+                                 is_constructor=True, is_library=False, missing=False,
+                                 implicit_constructor=True)
+                parent.add_node(synth_ctor)
+                try:
+                    all_nodes.append(synth_ctor)
+                except Exception:
+                    pass
+                logging.debug(f"[_find_link_for_call] Synthesized implicit constructor: {synth_ctor.token} parent={parent.token}")
+                return synth_ctor, None, None
+
     if len(possible_nodes) == 1:
         return possible_nodes[0], None, None
     if len(possible_nodes) > 1:
@@ -916,7 +945,13 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     library_nodes_by_signature = {}
     library_groups_by_module = {}
     # Builtin names (e.g. print, len) should be treated as library functions
-    builtin_names = set(dir(builtins))
+    # Use a callable filter so we only consider callable builtins (functions/types)
+    # and exclude non-callable names (constants, dunder names that aren't callables, etc.).
+    try:
+        builtin_names = {name for name, val in builtins.__dict__.items() if callable(val)}
+    except Exception:
+        # Fallback to the original approach if something unexpected happens
+        builtin_names = set(dir(builtins))
     
     unflatten_n_calls_all = [n.calls for n in all_nodes if n.calls]
     all_calls = flatten(unflatten_n_calls_all)
@@ -932,10 +967,14 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                 
                 # ライブラリモジュールのグループを作成または取得
                 if module_name not in library_groups_by_module:
+                    # Use a special display type for Python builtins so they
+                    # are shown under a "Built-in Functions" cluster instead
+                    # of the generic Library cluster.
+                    display_type = "Built-in Functions" if module_name == 'builtins' else "Library"
                     lib_group = Group(
                         token=module_name,
                         group_type=GROUP_TYPE.NAMESPACE,
-                        display_type="Library",
+                        display_type=display_type,
                         import_tokens=[module_name],
                         line_number=0,
                         parent=None
@@ -959,12 +998,24 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                 lib_group.add_node(lib_node)
                 library_nodes_by_signature[lib_signature] = lib_node
     
-    # ライブラリグループをfile_groupsに追加し、ライブラリノードをall_nodesに追加する
+    # ライブラリグループを file_groups に追加し、ライブラリノードを all_nodes に追加する
+    # Special-case: place the 'builtins' module in its own top-level file group
+    builtins_file_group = None
     for lib_group in library_groups_by_module.values():
-        # 最初のfile_groupに疑似サブグループとして追加する
-        if file_groups:
-            file_groups[0].add_subgroup(lib_group)
-            lib_group.parent = file_groups[0]
+        if lib_group.token == 'builtins':
+            # Create or reuse a top-level file_group for builtins so it doesn't
+            # appear as a subgroup of the analyzed source file (e.g. __init__.py).
+            if builtins_file_group is None:
+                builtins_file_group = Group(token='builtins', group_type=GROUP_TYPE.FILE,
+                                            display_type='File', import_tokens=[], line_number=0, parent=None)
+                file_groups.append(builtins_file_group)
+            builtins_file_group.add_subgroup(lib_group)
+            lib_group.parent = builtins_file_group
+        else:
+            # Attach other library groups as pseudo-subgroups of the first file_group
+            if file_groups:
+                file_groups[0].add_subgroup(lib_group)
+                lib_group.parent = file_groups[0]
         all_nodes.extend(lib_group.all_nodes())
 
     # 6. Find all calls between all nodes
@@ -993,10 +1044,11 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                     lib_sig = djoin(module_name, call.token)
                     # Ensure a builtin library group exists
                     if module_name not in library_groups_by_module:
+                        display_type = "Built-in Functions" if module_name == 'builtins' else "Library"
                         lib_group = Group(
                             token=module_name,
                             group_type=GROUP_TYPE.NAMESPACE,
-                            display_type="Library",
+                            display_type=display_type,
                             import_tokens=[module_name],
                             line_number=0,
                             parent=None
@@ -1025,8 +1077,18 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
 
                     # Ensure the builtin library group is attached to a file_group for output
                     if file_groups and lib_group.parent is None:
-                        file_groups[0].add_subgroup(lib_group)
-                        lib_group.parent = file_groups[0]
+                        # Prefer attaching builtins to their own top-level file group
+                        if lib_group.token == 'builtins':
+                            # Find existing builtins file group or create one
+                            existing = next((g for g in file_groups if g.token == 'builtins' and g.group_type == GROUP_TYPE.FILE), None)
+                            if existing is None:
+                                existing = Group(token='builtins', group_type=GROUP_TYPE.FILE, display_type='File', import_tokens=[], line_number=0, parent=None)
+                                file_groups.append(existing)
+                            existing.add_subgroup(lib_group)
+                            lib_group.parent = existing
+                        else:
+                            file_groups[0].add_subgroup(lib_group)
+                            lib_group.parent = file_groups[0]
                     # proceed to create edge to node_b (builtin)
                     
                 else:
@@ -1050,15 +1112,30 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
             edge = Edge(node_a, node_b)
             if alias_labels:
                 try:
-                    if call and not call.is_attr():
-                        # Name call like `abra3()` — find matching variable in scope
+                    if call:
                         vars_at_line = node_a.get_variables(call.line_number)
-                        for var in vars_at_line:
-                            if var.token == call.token:
-                                # If the variable points to the node we're linking to,
-                                # annotate the edge with the alias used.
+                        # 1) Non-attribute calls: same as before
+                        if not call.is_attr():
+                            for var in vars_at_line:
+                                if var.token == call.token:
+                                    # If the variable points to the node we're linking to,
+                                    # annotate the edge with the alias used.
+                                    if var.points_to == node_b or (isinstance(var.points_to, Group) and node_b in var.points_to.all_nodes()):
+                                        edge.label = f"as {call.token}()"
+                                        break
+                        else:
+                            # 2) Attribute calls like `obj.method()` — find variable matching owner_token
+                            owner = call.owner_token
+                            for var in vars_at_line:
+                                try:
+                                    if var.token != owner:
+                                        continue
+                                except Exception:
+                                    continue
+                                # If variable points to the node/group we're linking to,
+                                # label the edge with the alias used: `as obj.method()`
                                 if var.points_to == node_b or (isinstance(var.points_to, Group) and node_b in var.points_to.all_nodes()):
-                                    edge.label = f"as {call.token}()"
+                                    edge.label = f"as {var.token}.{call.token}()"
                                     break
                 except Exception:
                     # Be conservative: ignore labeling errors and emit unlabeled edge
