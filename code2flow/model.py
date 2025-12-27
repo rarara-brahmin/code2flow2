@@ -168,8 +168,11 @@ class Variable():
         :param str|Call|Node|Group points_to: (str/Call is eventually resolved to Nodes|Groups)
         :param int|None line_number:
         """
-        assert token
-        assert points_to
+        if not token:
+            raise ValueError("token must be provided")
+        # Accept empty mappings and other falsy-but-valid values; only None is invalid
+        if points_to is None:
+            raise ValueError("points_to must not be None")
         self.token = token
         self.points_to = points_to
         self.line_number = line_number
@@ -469,7 +472,8 @@ class Node():
                 # (handled by Python.get_call_from_func_element using scope_stack)
                 continue
             else:
-                assert isinstance(variable.points_to, (Node, Group))
+                if not isinstance(variable.points_to, (Node, Group)):
+                    raise TypeError("variable.points_to must be a Node or Group at this point")
 
     def to_dot(self):
         """
@@ -581,7 +585,8 @@ class Group():
         self.import_tokens = import_tokens or []
         self.inherits = inherits or []
         self.imports = []
-        assert group_type in GROUP_TYPE
+        if group_type not in GROUP_TYPE:
+            raise ValueError(f"Invalid group_type: {group_type}")
 
         self.uid = "cluster_" + os.urandom(4).hex()  # group doesn't work by syntax rules
 
@@ -657,7 +662,8 @@ class Group():
         __init__ vs __new__
         :rtype: Node|None
         """
-        assert self.group_type == GROUP_TYPE.CLASS
+        if self.group_type != GROUP_TYPE.CLASS:
+            return None
         constructors = [n for n in self.nodes if n.is_constructor]
         if constructors:
             return constructors[0]

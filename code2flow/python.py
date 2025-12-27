@@ -15,7 +15,8 @@ def get_call_from_func_element(func, scope_stack=None, call_node=None):
     :param func ast:
     :rtype: Call|None
     """
-    assert type(func) in (ast.Attribute, ast.Name, ast.Subscript, ast.Call)
+    if type(func) not in (ast.Attribute, ast.Name, ast.Subscript, ast.Call):
+        return None
     # Collect positional argument tokens if a full ast.Call node was provided
     arg_tokens = []
     if call_node is not None:
@@ -227,7 +228,8 @@ def process_import(element, scope_stack=None):
     ret = []
 
     for single_import in element.names:
-        assert isinstance(single_import, ast.alias)
+        if not isinstance(single_import, ast.alias):
+            continue
         token = single_import.asname or single_import.name
         rhs = single_import.name
 
@@ -484,7 +486,8 @@ class Python(BaseLanguage):
         :param parent Group:
         :rtype: Group
         """
-        assert type(tree) == ast.ClassDef
+        if type(tree) != ast.ClassDef:
+            raise TypeError("make_class_group expects ast.ClassDef")
         subgroup_trees, node_trees, body_trees, import_trees = Python.separate_namespaces(tree)
 
         group_type = GROUP_TYPE.CLASS
