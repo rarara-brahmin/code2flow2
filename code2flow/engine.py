@@ -855,7 +855,6 @@ def _find_links(node_a: Node, all_nodes):
         _possible_node, _call, _nodes = _find_link_for_call(call, node_a, all_nodes)
         # Return triple: (resolved_node_or_None, bad_call_or_None, original_call)
         lfc = (_possible_node, _call, call)
-        assert not isinstance(lfc, Group)
         links.append(lfc)
     return list(filter(None, links))
 
@@ -1464,13 +1463,17 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
     lang_params = lang_params or LanguageParams()
 
     exclude_namespaces = exclude_namespaces or []
-    assert isinstance(exclude_namespaces, list)
+    if not isinstance(exclude_namespaces, list):
+        raise TypeError("exclude_namespaces must be a list")
     exclude_functions = exclude_functions or []
-    assert isinstance(exclude_functions, list)
+    if not isinstance(exclude_functions, list):
+        raise TypeError("exclude_functions must be a list")
     include_only_namespaces = include_only_namespaces or []
-    assert isinstance(include_only_namespaces, list)
+    if not isinstance(include_only_namespaces, list):
+        raise TypeError("include_only_namespaces must be a list")
     include_only_functions = include_only_functions or []
-    assert isinstance(include_only_functions, list)
+    if not isinstance(include_only_functions, list):
+        raise TypeError("include_only_functions must be a list")
 
     logging.basicConfig(format="Code2Flow: %(message)s", level=level)
 
@@ -1484,20 +1487,21 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
     if isinstance(output_file, str):
         # output_fileがstr型の場合にTrue
         # https://docs.python.org/ja/3/library/functions.html#isinstance
-        assert '.' in output_file, "Output filename must end in one of: %r." % set(VALID_EXTENSIONS)
+        if '.' not in output_file:
+            raise ValueError("Output filename must end in one of: %r." % set(VALID_EXTENSIONS))
 
         output_ext = output_file.rsplit('.', 1)[1] or ''
         # output_fileの拡張子を取り出す。
         # 最大分割回数1回でindex=1を指定するとaaa.bbb.cccのcccが取り出せる。
-        assert output_ext in VALID_EXTENSIONS, "Output filename must end in one of: %r." % \
-                                               set(VALID_EXTENSIONS)
+        if output_ext not in VALID_EXTENSIONS:
+            raise ValueError("Output filename must end in one of: %r." % set(VALID_EXTENSIONS))
 
     final_img_filename = None
     extension = None
     if output_ext and output_ext in IMAGE_EXTENSIONS:
         # ToDo: １個目のoutput_extいるんだっけ？ 例外出る？
         if not is_installed('dot') and not is_installed('dot.exe'):
-            raise AssertionError(
+            raise RuntimeError(
                 "Can't generate a flowchart image because neither `dot` nor "
                 "`dot.exe` was found. Either install graphviz (see the README) "
                 "or, if you just want an intermediate text file, set your --output "

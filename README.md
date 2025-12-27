@@ -1,17 +1,22 @@
-![code2flow logo](https://raw.githubusercontent.com/scottrogowski/code2flow/master/assets/code2flowlogo.png)
+![Version 1.0.0](https://img.shields.io/badge/version-1.0.0-brightgreen) ![License MIT](https://img.shields.io/badge/license-MIT-green])
 
-![Version 2.5.1](https://img.shields.io/badge/version-2.5.1-brightgreen) ![Build passing](https://img.shields.io/badge/build-passing-brightgreen) ![Coverage 100%](https://img.shields.io/badge/coverage-100%25-brightgreen) ![License MIT](https://img.shields.io/badge/license-MIT-green])
+Code2flow2 generates [call graphs](https://en.wikipedia.org/wiki/Call_graph) for Python.
+Code2flow2 was created as a fork of Code2flow. We would like to express our respect for Code2flow, the original tool.
 
-Code2flow generates [call graphs](https://en.wikipedia.org/wiki/Call_graph) for dynamic programming language. Code2flow supports Python, JavaScript, Ruby, and PHP.
+Compared to the original Code2flow, Code2flow2 has the following differences:
+- Only Python is supported as the input language.
+- External libraries can be included in the call graph.
+- Built‑in functions can be included in the call graph.
+- Some support for higher‑order function application is provided.
+- Nested classes are supported.
 
-The basic algorithm is simple:
-
+The basic algorithm is the same as that of the original tool:
 1. Translate your source files into ASTs.
 1. Find all function definitions.
 1. Determine where those functions are called.
 1. Connect the dots.
 
-Code2flow is useful for:
+Code2flow2 is useful for:
 - Untangling spaghetti code.
 - Identifying orphaned functions.
 - Getting new developers up to speed.
