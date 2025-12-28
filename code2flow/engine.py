@@ -861,7 +861,9 @@ def _find_links(node_a: Node, all_nodes):
 
 def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_functions,
            include_only_namespaces, include_only_functions,
-           skip_parse_errors, lang_params, alias_labels=False, heuristics=True):
+           skip_parse_errors, lang_params, alias_labels=False, heuristics=True,
+           show_libraries=False):
+
     """
     Given a language implementation and a list of filenames, do these things:
     1. Read/parse source ASTs
@@ -1301,6 +1303,30 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     if no_trimming:
         return file_groups, all_nodes, edges
 
+    # Optionally remove library groups/nodes/edges from the output
+    if not show_libraries:
+        lib_nodes = {n for n in all_nodes if getattr(n, 'is_library', False)}
+        if lib_nodes:
+            # remove edges that reference library nodes
+            edges = [e for e in edges if e.node0 not in lib_nodes and e.node1 not in lib_nodes]
+            # remove library nodes from their parents
+            for n in list(lib_nodes):
+                try:
+                    n.remove_from_parent()
+                except Exception:
+                    pass
+            # remove library subgroups from file_groups
+            for fg in list(file_groups):
+                # remove subgroups whose display_type indicates library
+                for sg in list(fg.subgroups):
+                    if getattr(sg, 'display_type', '') in ('Library', 'Built-in Functions'):
+                        try:
+                            fg.subgroups.remove(sg)
+                        except Exception:
+                            pass
+            # update all_nodes to exclude libraries
+            all_nodes = [n for n in all_nodes if n not in lib_nodes]
+
     # 8. Trim nodes that didn't connect to anything
     nodes_with_edges = set()
     for edge in edges:
@@ -1435,7 +1461,7 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
               include_only_namespaces=None, include_only_functions=None,
               no_grouping=False, no_trimming=False, skip_parse_errors=False,
               lang_params=None, subset_params=None, alias_labels=False, level=logging.INFO,
-              heuristics=True):
+              heuristics=True, show_libraries=False):
     """
     Top-level function. Generate a diagram based on source code.
     Can generate either a dotfile or an image.
@@ -1514,7 +1540,8 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
                                            exclude_namespaces, exclude_functions,
                                            include_only_namespaces, include_only_functions,
                                            skip_parse_errors, lang_params,
-                                           alias_labels=alias_labels, heuristics=heuristics)
+                                           alias_labels=alias_labels, heuristics=heuristics,
+                                           show_libraries=show_libraries)
 
     if subset_params:
         logging.info("Filtering into subset...")
@@ -1628,6 +1655,15 @@ def main(sys_argv=None):
     parser.set_defaults(heuristics=True)
     parser.add_argument(
         '--version', action='version', version='%(prog)s ' + VERSION)
+    # Option to control whether imported library functions/modules are shown
+    lib_group = parser.add_mutually_exclusive_group()
+    lib_group.add_argument(
+        '--show-libraries', dest='show_libraries', action='store_true',
+        help='include imported library functions/modules in the generated graph')
+    lib_group.add_argument(
+        '--no-libraries', dest='show_libraries', action='store_false',
+        help='do not include imported library functions/modules in the generated graph')
+    parser.set_defaults(show_libraries=False)
 
     sys_argv = sys_argv or sys.argv[1:]
 
@@ -1697,4 +1733,5 @@ def main(sys_argv=None):
         alias_labels=alias_labels,
         level=level,
         heuristics=args.heuristics,
+        show_libraries=args.show_libraries,
     )
