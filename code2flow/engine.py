@@ -489,6 +489,10 @@ def _find_library_node_by_signature(call: Call, all_nodes: list[Node]) -> Node:
     if logging.getLogger().isEnabledFor(logging.DEBUG):
         logging.debug(f"[_find_library_node_by_signature] lib_signature={lib_signature} module_name={module_name} candidates={[(n.token, getattr(n.parent,'token',None), n.import_tokens, n.is_library) for n in candidates]}")
 
+    # Extra targeted debug for problematic calls
+    if call.token == 'add_mutually_exclusive_group':
+        logging.debug(f"[_find_library_node_by_signature] TARGET CALL: owner_token={call.owner_token} is_attr={call.is_attr()} is_library={call.is_library} lib_signature={lib_signature}")
+
     # Prefer concrete nodes (from parsed files) whose import_tokens match the signature
     # or whose parent module name matches. Do not restrict to node.is_library; real
     # file nodes should be considered first to avoid misattributing calls to libraries
@@ -554,6 +558,10 @@ def _find_library_node_from_variable(call: Call, var: Variable, all_nodes: list[
             if isinstance(node.parent, Group) and node.parent.token == lib_module_name:
                 logging.debug(f"[_find_library_node_from_variable] ライブラリノードが見つかりました: {node.token} parent={node.parent.token}")
                 return node
+
+    # Targeted debug when lookup fails for specific method
+    if call.token == 'add_mutually_exclusive_group':
+        logging.debug(f"[_find_library_node_from_variable] NO MATCH for token={call.token}, var.token={var.token}, lib_module_name={lib_module_name}, candidates_tokens={[n.token for n in candidates]}")
     
     logging.debug(f"[_find_library_node_from_variable] ライブラリノードが見つかりませんでした: token={call.token}, module={lib_module_name}")
     return None
@@ -575,6 +583,10 @@ def _find_link_for_call(call: Call, node_a: Node, all_nodes: list[Node]):
     :rtype: (Node|None, Call|None)
     """
     logging.debug(f"[_find_link_for_call] 呼び出しチェック開始: node_a.token={node_a.token}, call.to_string()={call.to_string()}, call.owner_token={call.owner_token}, call.token={call.token}, call.is_attr()={call.is_attr()}, call.is_library={call.is_library}")
+
+    # Targeted debug for methods we care about
+    if call.token == 'add_mutually_exclusive_group':
+        logging.debug(f"[_find_link_for_call] TARGET: checking add_mutually_exclusive_group for node {node_a.token}. call.owner_token={call.owner_token} is_attr={call.is_attr()} is_library={call.is_library}")
 
     # Handle calls made via super(), e.g. `super().method()`.
     # When we see an attribute call whose owner_token is 'super', resolve
@@ -861,7 +873,9 @@ def _find_links(node_a: Node, all_nodes):
 
 def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_functions,
            include_only_namespaces, include_only_functions,
-           skip_parse_errors, lang_params, alias_labels=False, heuristics=True):
+           skip_parse_errors, lang_params, alias_labels=False, heuristics=True,
+           show_libraries=False):
+
     """
     Given a language implementation and a list of filenames, do these things:
     1. Read/parse source ASTs
@@ -1037,6 +1051,32 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                                 logging.debug(f"[arg-prop] Propagated arg {arg_tok} -> {target.token}.{param_name}")
                                 break
 
+    # Temporary debug: inspect any Variable named 'arg_parser' or 'parser'
+    try:
+        for node in all_nodes:
+            vars_list = getattr(node, 'variables', None) or []
+            for var in vars_list:
+                try:
+                    if var.token in ('arg_parser', 'parser'):
+                        pts = getattr(var, 'points_to', None)
+                        if pts is None:
+                            logging.info(f"[DEBUG_VAR] {var.token} -> points_to is None (node={getattr(node,'token',None)})")
+                        else:
+                            # If it's a Call, show owner_token/token/is_library
+                            from .model import Call as _Call, Node as _Node, Group as _Group
+                            if isinstance(pts, _Call):
+                                logging.info(f"[DEBUG_VAR] {var.token} -> Call owner_token={getattr(pts,'owner_token',None)} token={getattr(pts,'token',None)} is_library={getattr(pts,'is_library',False)} (node={getattr(node,'token',None)})")
+                            elif isinstance(pts, _Node):
+                                logging.info(f"[DEBUG_VAR] {var.token} -> Node token={getattr(pts,'token',None)} parent={getattr(getattr(pts,'parent',None),'token',None)} is_library={getattr(pts,'is_library',False)} (node={getattr(node,'token',None)})")
+                            elif isinstance(pts, _Group):
+                                logging.info(f"[DEBUG_VAR] {var.token} -> Group token={getattr(pts,'token',None)} display_type={getattr(pts,'display_type',None)} (node={getattr(node,'token',None)})")
+                            else:
+                                logging.info(f"[DEBUG_VAR] {var.token} -> points_to type={type(pts).__name__} repr={pts!r} (node={getattr(node,'token',None)})")
+                except Exception:
+                    logging.exception("[DEBUG_VAR] error while inspecting variable")
+    except Exception:
+        logging.exception("[DEBUG_VAR] error iterating variables")
+
     # Not a step. Just log what we know so far
     logging.info("Found groups %r." % [g.label() for g in all_subgroups])
     logging.info("Found nodes %r." % sorted(n.token_with_ownership() for n in all_nodes))
@@ -1102,6 +1142,78 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
                 
                 lib_group.add_node(lib_node)
                 library_nodes_by_signature[lib_signature] = lib_node
+                # Ensure synthesized library nodes are visible to the resolver
+                try:
+                    all_nodes.append(lib_node)
+                except Exception:
+                    pass
+
+    # Handle instance-method calls on variables that point to library constructors.
+    # Example: `arg_parser = argparse.ArgumentParser()` then `arg_parser.add_mutually_exclusive_group()`
+    # In this case, synthesize a library node for `argparse.add_mutually_exclusive_group` so
+    # instance-method calls can be linked to the appropriate library function node.
+    try:
+        for call in all_calls:
+            try:
+                if not (call.is_attr() and call.owner_token):
+                    continue
+                owner_token = call.owner_token
+                # Skip if owner_token already looks like a module (dotted) or is itself a module name
+                # We are interested in variables (simple names) that reference library instances.
+                if '.' in owner_token:
+                    continue
+                # Find a Variable with this token across all nodes
+                found_var = None
+                for node in all_nodes:
+                    vars_list = getattr(node, 'variables', None) or []
+                    for var in vars_list:
+                        if var.token == owner_token:
+                            found_var = var
+                            break
+                    if found_var:
+                        break
+                if not found_var:
+                    continue
+                pts = getattr(found_var, 'points_to', None)
+                # We only care about variables whose points_to is a library Call
+                if not isinstance(pts, Call) or not getattr(pts, 'is_library', False):
+                    continue
+                # Derive module name from the constructor call owner_token
+                module_name = pts.owner_token.split('.')[0] if '.' in pts.owner_token else pts.owner_token
+                lib_signature = djoin(module_name, call.token)
+                if lib_signature in library_nodes_by_signature:
+                    continue
+                # Ensure a library group exists for this module
+                if module_name not in library_groups_by_module:
+                    display_type = "Built-in Functions" if module_name == 'builtins' else "Library"
+                    lib_group = Group(
+                        token=module_name,
+                        group_type=GROUP_TYPE.NAMESPACE,
+                        display_type=display_type,
+                        import_tokens=[module_name],
+                        line_number=0,
+                        parent=None
+                    )
+                    library_groups_by_module[module_name] = lib_group
+                lib_group = library_groups_by_module[module_name]
+                lib_node = Node(
+                    token=call.token,
+                    calls=[],
+                    variables=None,
+                    parent=lib_group,
+                    import_tokens=[lib_signature],
+                    line_number=call.line_number,
+                    is_constructor=False,
+                    is_library=True
+                )
+                lib_group.add_node(lib_node)
+                library_nodes_by_signature[lib_signature] = lib_node
+                # Debug: report that we synthesized an instance-based library node
+                logging.debug(f"[LIB_SYNTH] synthesized {lib_signature} -> node token={lib_node.token} parent={lib_group.token}")
+            except Exception:
+                logging.exception("Error while synthesizing instance-based library node for call %r", getattr(call, 'to_string', lambda: call)())
+    except Exception:
+        logging.exception("Unexpected error during instance-method library synthesis")
     
     # ライブラリグループを file_groups に追加し、ライブラリノードを all_nodes に追加する
     # Special-case: place the 'builtins' module in its own top-level file group
@@ -1301,6 +1413,30 @@ def map_it(sources, extension, no_trimming, exclude_namespaces, exclude_function
     if no_trimming:
         return file_groups, all_nodes, edges
 
+    # Optionally remove library groups/nodes/edges from the output
+    if not show_libraries:
+        lib_nodes = {n for n in all_nodes if getattr(n, 'is_library', False)}
+        if lib_nodes:
+            # remove edges that reference library nodes
+            edges = [e for e in edges if e.node0 not in lib_nodes and e.node1 not in lib_nodes]
+            # remove library nodes from their parents
+            for n in list(lib_nodes):
+                try:
+                    n.remove_from_parent()
+                except Exception:
+                    pass
+            # remove library subgroups from file_groups
+            for fg in list(file_groups):
+                # remove subgroups whose display_type indicates library
+                for sg in list(fg.subgroups):
+                    if getattr(sg, 'display_type', '') in ('Library', 'Built-in Functions'):
+                        try:
+                            fg.subgroups.remove(sg)
+                        except Exception:
+                            pass
+            # update all_nodes to exclude libraries
+            all_nodes = [n for n in all_nodes if n not in lib_nodes]
+
     # 8. Trim nodes that didn't connect to anything
     nodes_with_edges = set()
     for edge in edges:
@@ -1435,7 +1571,7 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
               include_only_namespaces=None, include_only_functions=None,
               no_grouping=False, no_trimming=False, skip_parse_errors=False,
               lang_params=None, subset_params=None, alias_labels=False, level=logging.INFO,
-              heuristics=True):
+              heuristics=True, show_libraries=False):
     """
     Top-level function. Generate a diagram based on source code.
     Can generate either a dotfile or an image.
@@ -1514,7 +1650,8 @@ def code2flow(raw_source_paths, output_file, language=None, hide_legend=True,
                                            exclude_namespaces, exclude_functions,
                                            include_only_namespaces, include_only_functions,
                                            skip_parse_errors, lang_params,
-                                           alias_labels=alias_labels, heuristics=heuristics)
+                                           alias_labels=alias_labels, heuristics=heuristics,
+                                           show_libraries=show_libraries)
 
     if subset_params:
         logging.info("Filtering into subset...")
@@ -1554,80 +1691,89 @@ def main(sys_argv=None):
     :param sys_argv list:
     :rtype: None
     """
-    parser = argparse.ArgumentParser(
+    arg_parser = argparse.ArgumentParser(
         description=DESCRIPTION,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument(
+    arg_parser.add_argument(
         'sources', metavar='sources', nargs='+',
         help='source code file/directory paths.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--output', '-o', default='out.svg',
         help=f'output file path. Supported types are {VALID_EXTENSIONS}.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--language', choices=['py', 'js', 'rb', 'php'],
         help='process this language and ignore all other files.'
              'If omitted, use the suffix of the first source file.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--target-function',
         help='output a subset of the graph centered on this function. '
              'Valid formats include `func`, `class.func`, and `file::class.func`. '
              'Requires --upstream-depth and/or --downstream-depth. ')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--upst'
         'ream-depth', type=int, default=0,
         help='include n nodes upstream of --target-function.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--downstream-depth', type=int, default=0,
         help='include n nodes downstream of --target-function.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--exclude-functions',
         help='exclude functions from the output. Comma delimited.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--exclude-namespaces',
         help='exclude namespaces (Classes, modules, etc) from the output. Comma delimited.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--include-only-functions',
         help='include only functions in the output. Comma delimited.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--include-only-namespaces',
         help='include only namespaces (Classes, modules, etc) in the output. Comma delimited.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--no-grouping', action='store_true',
         help='instead of grouping functions into namespaces, let functions float.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--no-trimming', action='store_true',
         help='show all functions/namespaces whether or not they connect to anything.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--hide-legend', action='store_true',
         help='by default, Code2flow generates a small legend. This flag hides it.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--skip-parse-errors', action='store_true',
         help='skip files that the language parser fails on.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--source-type', choices=['script', 'module'], default='script',
         help='js only. Parse the source as scripts (commonJS) or modules (es6)')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--ruby-version', default='27',
         help='ruby only. Which ruby version to parse? This is passed directly into ruby-parse. '
              'Use numbers like 25, 27, or 31.')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--quiet', '-q', action='store_true',
         help='suppress most logging')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--verbose', '-v', action='store_true',
         help='add more logging')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--alias-labels', action='store_true',
         help='エッジに変数エイリアス経由の呼び出しをラベル表示します (例: as abra3()).')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--heuristics', dest='heuristics', action='store_true',
         help='Enable resolution heuristics (recursive local imports, inheritance-aware self resolution).')
-    parser.add_argument(
+    arg_parser.add_argument(
         '--no-heuristics', dest='heuristics', action='store_false',
         help='Disable resolution heuristics; only parse explicit files and do not apply inheritance heuristics.')
-    parser.set_defaults(heuristics=True)
-    parser.add_argument(
+    arg_parser.set_defaults(heuristics=True)
+    arg_parser.add_argument(
         '--version', action='version', version='%(prog)s ' + VERSION)
+    # Option to control whether imported library functions/modules are shown
+    lib_group = arg_parser.add_mutually_exclusive_group()
+    lib_group.add_argument(
+        '--show-libraries', dest='show_libraries', action='store_true',
+        help='include imported library functions/modules in the generated graph')
+    lib_group.add_argument(
+        '--no-libraries', dest='show_libraries', action='store_false',
+        help='do not include imported library functions/modules in the generated graph')
+    arg_parser.set_defaults(show_libraries=False)
 
     sys_argv = sys_argv or sys.argv[1:]
 
@@ -1655,7 +1801,29 @@ def main(sys_argv=None):
         filtered_argv.append(item)
 
     sys_argv = filtered_argv
-    args = parser.parse_args(sys_argv)
+
+    # Temporary debug: report what local names 'parser' and 'arg_parser' refer to
+    try:
+        _parser_val = parser
+    except NameError:
+        print("DEBUG: local name 'parser' is not defined in engine.main()")
+    else:
+        try:
+            print(f"DEBUG: local name 'parser' -> type={type(_parser_val).__name__} repr={_parser_val!r}")
+        except Exception:
+            print(f"DEBUG: local name 'parser' -> type={type(_parser_val).__name__}")
+
+    try:
+        _arg_parser_val = arg_parser
+    except NameError:
+        print("DEBUG: local name 'arg_parser' is not defined in engine.main()")
+    else:
+        try:
+            print(f"DEBUG: local name 'arg_parser' -> type={type(_arg_parser_val).__name__} repr={_arg_parser_val!r}")
+        except Exception:
+            print(f"DEBUG: local name 'arg_parser' -> type={type(_arg_parser_val).__name__}")
+
+    args = arg_parser.parse_args(sys_argv)
     level = logging.INFO
     if args.verbose and args.quiet:
         raise AssertionError("Passed both --verbose and --quiet flags")
@@ -1697,4 +1865,5 @@ def main(sys_argv=None):
         alias_labels=alias_labels,
         level=level,
         heuristics=args.heuristics,
+        show_libraries=args.show_libraries,
     )
