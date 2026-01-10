@@ -224,18 +224,28 @@ class Call():
     def is_attr(self):
         """
         Attribute calls are like `a.do_something()` rather than `do_something()`
+        オブジェクトのメソッド属性か否かを確認する。
+        （token(コールされた関数)がAttribute(属性)である場合はメソッドであるため）
         :rtype: bool
         """
         return self.owner_token is not None
 
     def matches_variable(self, variable):
         """
-        この変数が呼び出しの対象であるかどうかを確認する。
+        Call(関数呼び出し式)が、本メソッドに与えられたVariableによって「作用されている(対象になっている）」かを判定し、
+        対応する Node(または特殊値)を返す。主に以下の2種類の呼び出しを区別して処理する。
         例えば'obj'という変数が以下の式から生成され、
             obj = Obj()
         以下のように呼び出された場合、
             obj.do_something()
         do_somethingノードがobjからリターンされる。
+
+        引数: variable — Variable インスタンス（token, points_to を持つ）
+        戻り値:
+            通常は Node（該当する関数・メソッドノード）
+            名前空間不明等の定数については文字列（OWNER_CONST の値）を返すことがある
+            マッチしない場合は None
+        この変数が呼び出しの対象であるかどうかを確認する。
 
         Check whether this variable is what the call is acting on.
         For example, if we had 'obj' from
@@ -248,26 +258,20 @@ class Call():
         :rtype: Node
         """
 
-        if variable.token == "req":
-            pass
-            # デバッグ用。ブレイクポイントいらなくなったら消す。
-        elif self.is_attr():
-            pass
-
+        # 
         if self.is_attr():
-            # ToDo: このowner_token == variable.tokenという判定がライブラリの呼び出しを誤判定させている？
-            #    ライブラリの呼び出しはvar = lib_name.func_name()という形になるので上記が真にならない？
-            #    (ライブラリ呼び出し時はowner_token: lib_name, variable.token: varになる）
-            #    このowner_tokenというのはどこで入力されるのか。
-            #    ⇒owner_tokenはpython.py get_call_from_func_element()で格納されている。
-            #      格納対象はCallクラスのfuncプロパティ(Name型)のidプロパティである。
-            #      https://docs.python.org/3/library/ast.html#ast.Call
+            # ライブラリ呼び出しはver = lib_name.func_name()という形になるので
+            # owner_tokenにはlib_name、variable.tokenにはvarが入る。
+            # 通常の関数の場合にはowner_tokenとvariable.tokenが一致する。
+            # ⇒owner_tokenはpython.py get_call_from_func_element()で格納されている。
+            #   格納対象はast.Callクラスのfuncプロパティ(Name型)のidプロパティである。
+            #   https://docs.python.org/3/library/ast.html#ast.Call
             if self.owner_token == variable.token or self.is_library:
-                # ToDo: owner_token == variable.tokenの条件を満たしていなくても通してよいケースとは？
-                #   ⇒ライブラリの呼び出しである場合。
-                #    ライブラリの一覧を持っておいてowner_tokenと照合する？
-                #    Callの中にライブラリか否かの情報を持っておけないだろうか？
-                #   ⇒持たせてみた
+                # owner_token == variable.tokenの条件を満たしていなくても通してよいケースとは？
+                # ⇒ライブラリの呼び出しである場合。
+                #  ライブラリの一覧を持っておいてowner_tokenと照合する？
+                #  Callの中にライブラリか否かの情報を持っておけないだろうか？
+                # ⇒持たせてみた
                 for node in getattr(variable.points_to, 'nodes', []):
                     # variable.point_toオブジェクトのnodes属性(nodeのリスト?)を取り出す。
                     if self.token == node.token:
@@ -281,13 +285,9 @@ class Call():
                 if variable.points_to in OWNER_CONST:
                     return variable.points_to
 
-                # ToDo:requests.getをNodeとして返してあげる処理を書く必要あり。
-
-
 
             # This section is specifically for resolving namespace variables
-            if isinstance(variable.points_to, Group) \
-               and variable.points_to.group_type == GROUP_TYPE.NAMESPACE:
+            if isinstance(variable.points_to, Group) and variable.points_to.group_type == GROUP_TYPE.NAMESPACE:
                 parts = self.owner_token.split('.')
                 if len(parts) != 2:
                     return None
